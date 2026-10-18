@@ -62,7 +62,8 @@ import {
   haltOnTimedout,
   timeoutErrorHandler,
 } from "./middleware/timeout";
-import { requireAuth } from "./middleware/auth";
+import { requireAuth, verifyTokenStateful } from "./middleware/auth";
+import { isAccountActive } from "./middleware/checkAccountStatus";
 import { responseTime } from "./middleware/responseTime";
 import { requestId } from "./middleware/requestId";
 import { idempotency } from "./middleware/idempotency";
@@ -802,7 +803,17 @@ async function initializeRuntime(): Promise<void> {
       console.log(`HTTP/1.1 server running on http://localhost:${PORT}`);
     });
 
-    wsManager = new WebSocketManager(server);
+    wsManager = new WebSocketManager(server, {
+      // Issue #814: revalidate credentials and account status at handshake
+      // time (stateful Redis check + frozen/suspended/deactivated rejection).
+      verifyConnection: async (token) => {
+        const claims = await verifyTokenStateful(token);
+        if (claims.userId && !(await isAccountActive(claims.userId))) {
+          throw new Error("Account is not active");
+        }
+        return claims;
+      },
+    });
     console.log("WebSocket server attached");
 
     // Start Apollo Server with APQ enabled (must run after HTTP server is created)

@@ -38,24 +38,15 @@ import {
 } from "../middleware/authRateLimit";
 import { ERROR_CODES } from "../constants/errorCodes";
 import { createError } from "../middleware/errorHandler";
+import { registerSchema } from "../validation/authSchemas";
 
 const emailService = new EmailService();
 
 export const authRoutes = Router();
 
-export const registerSchema = z.object({
-  phone_number: z.string().min(1, "phone_number is required"),
-  password: z
-    .string()
-    .min(12, "Password must be at least 12 characters")
-    .regex(/[A-Z]/, "Password must contain at least one uppercase letter")
-    .regex(/[a-z]/, "Password must contain at least one lowercase letter")
-    .regex(/[0-9]/, "Password must contain at least one number")
-    .regex(
-      /[^A-Za-z0-9]/,
-      "Password must contain at least one special character",
-    ),
-});
+// Shared with the OpenAPI generator (src/openapi/schemas/auth.ts) so the
+// documented constraints always match what this endpoint accepts.
+export { registerSchema };
 
 /**
  * POST /api/auth/register

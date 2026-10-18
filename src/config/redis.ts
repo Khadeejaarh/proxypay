@@ -290,11 +290,22 @@ export function createRedisStore() {
 
 export async function flushUserSessions(userId: string): Promise<void> {
   if (!redisClient.isOpen) return;
-  
+
   try {
     // 1. Set invalidation timestamp to instantly reject active stateless JWTs
     const now = Math.floor(Date.now() / 1000);
     await redisClient.set(`user:${userId}:jwt_invalidated_at`, now.toString());
+
+    // 2. Fan out to every instance so open WebSockets/subscriptions for this
+    //    user are terminated immediately (issue #814). See wsSessionAuth.ts.
+    try {
+      await redisClient.publish(
+        "ws.auth.revoked",
+        JSON.stringify({ userId, reason: "flushUserSessions" }),
+      );
+    } catch (pubErr) {
+      console.warn("Redis: failed to publish WS revocation for user", userId, pubErr);
+    }
 
     // 2. Scan and destroy all express-sessions tied to this user
     let cursor = "0";

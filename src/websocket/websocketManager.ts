@@ -2,6 +2,16 @@ import { WebSocketServer, WebSocket } from "ws";
 import { IncomingMessage, Server } from "http";
 import { createClient, RedisClientType } from "redis";
 import { verifyToken } from "../auth/jwt";
+import {
+  wsSessionRegistry,
+  WS_REVOCATION_CHANNEL,
+  handleAuthRevocation,
+  tokenExpiryFromClaims,
+  sessionIdFromClaims,
+  WS_AUTH_POLICY_VIOLATION,
+  type AuthRevocationEvent,
+  type TrackedSession,
+} from "./wsSessionAuth";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -24,6 +34,9 @@ interface AuthenticatedWebSocket extends WebSocket {
   userId?: string;
   subscriptions: Set<string>;
   missedPings: number; // tracks consecutive missed pongs
+  tokenExpiresAt?: number | null; // JWT exp (Unix seconds) for expiry revalidation
+  sessionId?: string | null; // JWT sessionId used for per-session revocation
+  wsSession?: TrackedSession; // registry entry for #814 revalidation
 }
 
 // ---------------------------------------------------------------------------
@@ -40,6 +53,36 @@ interface AuthenticatedWebSocket extends WebSocket {
  *  - Redis pub/sub for horizontal scaling across multiple process instances
  */
 export const TRANSACTION_UPDATES_CHANNEL = "transaction.updates";
+
+/** Claims returned by a connection verifier (#814). */
+export interface VerifiedConnectionClaims {
+  userId?: string | null;
+  sub?: string;
+  exp?: number;
+  sessionId?: string;
+}
+
+/**
+ * Verifies a connection token. The default implementation runs the
+ * cryptographic check only; production wiring supplies a stateful verifier
+ * (Redis revocation/session binding + user status) so suspended or
+ * deactivated users are rejected at handshake time.
+ */
+export type WebSocketConnectionVerifier = (
+  token: string,
+) => VerifiedConnectionClaims | Promise<VerifiedConnectionClaims>;
+
+export interface WebSocketManagerOptions {
+  verifyConnection?: WebSocketConnectionVerifier;
+}
+
+function isPromiseLike<T>(value: unknown): value is Promise<T> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as { then?: unknown }).then === "function"
+  );
+}
 
 export class WebSocketManager {
   private static activeInstance: WebSocketManager | null = null;
@@ -62,8 +105,12 @@ export class WebSocketManager {
   private readonly REDIS_CHANNEL = TRANSACTION_UPDATES_CHANNEL;
   private readonly HEARTBEAT_INTERVAL_MS = 10_000; // faster heartbeat for quicker stale detection
   private readonly MAX_MISSED_PINGS = 2; // number of missed pings before termination
+  private readonly verifyConnection: WebSocketConnectionVerifier;
 
-  constructor(httpServer: Server) {
+  constructor(httpServer: Server, options: WebSocketManagerOptions = {}) {
+    this.verifyConnection =
+      options.verifyConnection ??
+      ((token) => verifyToken(token) as VerifiedConnectionClaims);
     this.wss = new WebSocketServer({ server: httpServer });
     WebSocketManager.activeInstance = this;
     this.init();
@@ -91,59 +138,103 @@ export class WebSocketManager {
         return;
       }
 
-      try {
-        const decoded = verifyToken(token) as unknown as Record<
-          string,
-          unknown
-        >;
-        const candidateUserId =
-          typeof decoded.userId === "string"
-            ? decoded.userId
-            : typeof decoded.sub === "string"
-              ? decoded.sub
-              : null;
-
-        if (!candidateUserId) {
-          client.close(1008, "Invalid authentication payload");
-          return;
+      // The verifier may be synchronous (default: cryptographic check) or
+      // async (production: stateful Redis/user-status check). Support both so
+      // the sync path keeps its immediate handshake semantics.
+      const settle = (decoded: VerifiedConnectionClaims): void => {
+        try {
+          this.completeHandshake(client, decoded);
+        } catch {
+          client.close(1008, "Invalid or expired token");
         }
+      };
 
-        client.userId = candidateUserId;
+      let result: VerifiedConnectionClaims | Promise<VerifiedConnectionClaims>;
+      try {
+        result = this.verifyConnection(token);
       } catch {
         client.close(1008, "Invalid or expired token");
         return;
       }
 
-      const clientId = `${client.userId}::${Date.now()}::${this.nextClientId++}`;
-      this.clients.set(clientId, client);
-      this.joinUserRoom(client.userId, clientId);
+      if (isPromiseLike<VerifiedConnectionClaims>(result)) {
+        result.then(settle).catch(() => {
+          client.close(1008, "Invalid or expired token");
+        });
+      } else {
+        settle(result);
+      }
+    });
+  }
 
-      console.log(`WebSocket client connected: ${clientId}`);
+  /**
+   * Completes the handshake for an authenticated client: validates the
+   * payload, checks the revocation registry, tracks the session for expiry /
+   * revocation revalidation (#814) and wires up the socket handlers.
+   */
+  private completeHandshake(
+    client: AuthenticatedWebSocket,
+    decoded: VerifiedConnectionClaims,
+  ): void {
+    const candidateUserId =
+      typeof decoded.userId === "string"
+        ? decoded.userId
+        : typeof decoded.sub === "string"
+          ? decoded.sub
+          : null;
 
-      // Handle pong responses to the heartbeat
-      client.on("pong", () => {
-        client.isAlive = true;
-      });
+    if (!candidateUserId) {
+      client.close(1008, "Invalid authentication payload");
+      return;
+    }
 
-      // Handle incoming messages from client
-      client.on("message", (rawData) => {
-        this.handleMessage(clientId, client, rawData.toString());
-      });
+    // Reject connections for a user whose sessions were just flushed
+    // (e.g. password change / logout) even if the JWT still verifies.
+    if (wsSessionRegistry.isRevoked(candidateUserId)) {
+      client.close(WS_AUTH_POLICY_VIOLATION, "Authentication revoked");
+      return;
+    }
 
-      // Cleanup on disconnect
-      client.on("close", () => {
-        this.handleDisconnect(clientId, client);
-      });
+    client.userId = candidateUserId;
+    client.tokenExpiresAt = tokenExpiryFromClaims(decoded);
+    client.sessionId = sessionIdFromClaims(decoded);
 
-      client.on("error", (err) => {
-        console.error(`WebSocket client error (${clientId}):`, err);
-      });
+    const clientId = `${client.userId}::${Date.now()}::${this.nextClientId++}`;
+    this.clients.set(clientId, client);
+    this.joinUserRoom(client.userId, clientId);
+    client.wsSession = {
+      userId: client.userId,
+      tokenExpiresAt: client.tokenExpiresAt ?? null,
+      sessionId: client.sessionId ?? null,
+      close: (code, reason) => client.close(code, reason),
+    };
+    wsSessionRegistry.add(client.wsSession);
 
-      // Acknowledge connection
-      this.sendToClient(client, {
-        type: "connection.ack",
-        data: { clientId, userId: client.userId },
-      });
+    console.log(`WebSocket client connected: ${clientId}`);
+
+    // Handle pong responses to the heartbeat
+    client.on("pong", () => {
+      client.isAlive = true;
+    });
+
+    // Handle incoming messages from client
+    client.on("message", (rawData) => {
+      this.handleMessage(clientId, client, rawData.toString());
+    });
+
+    // Cleanup on disconnect
+    client.on("close", () => {
+      this.handleDisconnect(clientId, client);
+    });
+
+    client.on("error", (err) => {
+      console.error(`WebSocket client error (${clientId}):`, err);
+    });
+
+    // Acknowledge connection
+    this.sendToClient(client, {
+      type: "connection.ack",
+      data: { clientId, userId: client.userId },
     });
   }
 
@@ -342,6 +433,11 @@ export class WebSocketManager {
       this.subscriptions.get(transactionId)?.delete(clientId);
     }
     this.leaveUserRoom(client.userId, clientId);
+    // Drop the revalidation entry (issue #814)
+    if (client.wsSession) {
+      wsSessionRegistry.remove(client.wsSession);
+      client.wsSession = undefined;
+    }
     this.clients.delete(clientId);
     console.log(`WebSocket client disconnected: ${clientId}`);
   }
@@ -352,6 +448,14 @@ export class WebSocketManager {
 
   private startHeartbeat(): void {
     this.heartbeatInterval = setInterval(() => {
+      // Revalidate auth: terminate sockets whose token expired since the
+      // handshake (issue #814). Closing triggers the 'close' handler, which
+      // cleans up this.clients/subscriptions via handleDisconnect.
+      const reaped = wsSessionRegistry.reapExpired();
+      if (reaped > 0) {
+        console.log(`WebSocket: terminated ${reaped} session(s) with expired tokens`);
+      }
+
       for (const [clientId, client] of this.clients) {
         if (!client.isAlive) {
           client.missedPings += 1;
@@ -410,6 +514,22 @@ export class WebSocketManager {
       }
     });
 
+    // Cross-instance auth revocation: terminate this instance's sockets for a
+    // user whose sessions were flushed elsewhere (issue #814).
+    await this.redisSub.subscribe(WS_REVOCATION_CHANNEL, (rawMessage: string) => {
+      try {
+        const event = JSON.parse(rawMessage) as AuthRevocationEvent;
+        const terminated = handleAuthRevocation(event);
+        if (terminated > 0) {
+          console.log(
+            `WebSocket: revoked auth terminated ${terminated} session(s) for user ${event.userId}`,
+          );
+        }
+      } catch (err) {
+        console.error("Failed to handle WS auth revocation message:", err);
+      }
+    });
+
     console.log("WebSocket: Redis pub/sub connected");
   }
 
@@ -426,6 +546,10 @@ export class WebSocketManager {
     // Upgraded WebSocket connections are not regular HTTP requests and can
     // otherwise keep the shared server alive indefinitely during shutdown.
     for (const client of this.clients.values()) {
+      if (client.wsSession) {
+        wsSessionRegistry.remove(client.wsSession);
+        client.wsSession = undefined;
+      }
       client.terminate();
     }
     this.clients.clear();

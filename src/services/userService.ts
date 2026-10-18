@@ -421,3 +421,17 @@ export async function invalidateUserOnPasswordChange(userId: string): Promise<vo
   // 3. Flush Redis express-sessions and flag active stateless JWTs
   await flushUserSessions(userId);
 }
+
+/**
+ * Revokes active sessions for a user after a non-active status change
+ * (freeze/suspend/deactivate) so open WebSockets and GraphQL subscriptions are
+ * terminated immediately (issue #814). `flushUserSessions` also publishes the
+ * cross-instance `ws.auth.revoked` event.
+ */
+export async function revokeUserSessionsOnStatusChange(
+  userId: string,
+  status: string,
+): Promise<void> {
+  if (status === "active") return;
+  await flushUserSessions(userId);
+}

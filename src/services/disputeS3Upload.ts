@@ -2,6 +2,14 @@ import { PutObjectCommand, HeadObjectCommand, CopyObjectCommand, GetObjectComman
 import { S3Client, CreateBucketCommand, PutBucketReplicationCommand, PutBucketVersioningCommand, HeadBucketCommand } from '@aws-sdk/client-s3';
 import { getS3Client, s3Config, getS3ObjectUrl } from '../config/s3';
 import { generateUniqueFilename, generateDisputeS3Key } from '../middleware/disputeUpload';
+import {
+  inspectFileSignature,
+  inspectArchiveSafety,
+} from './fileSecurityService';
+import {
+  DISPUTE_EVIDENCE_UPLOAD_LIMITS,
+  DISPUTE_ARCHIVE_SAFETY_LIMITS,
+} from '../config/uploadLimits';
 
 export interface DisputeUploadResult {
   success: boolean;
@@ -318,36 +326,54 @@ export const disputeEvidenceExistsInS3 = async (key: string): Promise<boolean> =
 };
 
 /**
- * Validate dispute evidence file before upload
+ * Validate dispute evidence file before upload.
+ *
+ * Enforces the per-route byte/count limits from
+ * `DISPUTE_EVIDENCE_UPLOAD_LIMITS`, then inspects the actual file content:
+ * magic bytes must match the declared type (office containers are accepted
+ * as their zip/OLE2 equivalents) and zip-based containers must stay within
+ * the archive-safety budget so archive bombs are rejected before storage.
  */
 export const validateDisputeEvidenceFile = (file: Express.Multer.File): { valid: boolean; error?: string } => {
-  const allowedMimeTypes = [
-    'application/pdf',
-    'image/jpeg', 
-    'image/jpg',
-    'image/png',
-    'image/gif',
-    'text/plain',
-    'application/msword',
-    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    'application/vnd.ms-excel',
-    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-  ];
-  const maxSize = 10 * 1024 * 1024; // 10MB
-  
-  if (!allowedMimeTypes.includes(file.mimetype)) {
+  const limits = DISPUTE_EVIDENCE_UPLOAD_LIMITS;
+
+  if (!limits.allowedMimeTypes.includes(file.mimetype)) {
     return {
       valid: false,
-      error: `Invalid file type. Allowed types: ${allowedMimeTypes.join(', ')}`,
+      error: `Invalid file type. Allowed types: ${limits.allowedMimeTypes.join(', ')}`,
     };
   }
-  
-  if (file.size > maxSize) {
+
+  if (file.size > limits.maxFileSizeBytes) {
     return {
       valid: false,
-      error: `File size exceeds maximum limit of ${maxSize / (1024 * 1024)}MB`,
+      error: `File size exceeds maximum limit of ${limits.maxFileSizeBytes / (1024 * 1024)}MB`,
     };
   }
-  
+
+  // Inspect the actual content (magic bytes): catches spoofed extensions,
+  // polyglots and archives smuggled in as other document types.
+  const signature = inspectFileSignature(file, {
+    allowedDeclaredTypes: [...limits.allowedMimeTypes],
+  });
+  if (!signature.ok) {
+    return {
+      valid: false,
+      error: signature.reason || 'File content does not match its declared type',
+    };
+  }
+
+  // Archive-bomb guard for zip-based containers (docx/xlsx): the declared
+  // decompressed size and compression ratio must stay within budget.
+  if (signature.detectedMimetype === 'application/zip') {
+    const archive = inspectArchiveSafety(file.buffer, DISPUTE_ARCHIVE_SAFETY_LIMITS);
+    if (!archive.ok) {
+      return {
+        valid: false,
+        error: archive.reason || 'Archive rejected by safety limits',
+      };
+    }
+  }
+
   return { valid: true };
 };

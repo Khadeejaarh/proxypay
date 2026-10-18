@@ -158,6 +158,17 @@ const MAGIC_SIGNATURES: MagicSignature[] = [
       (buf[2] === 0x03 || buf[2] === 0x05 || buf[2] === 0x07),
   },
   {
+    // Legacy Microsoft OLE2 compound document (.doc / .xls)
+    mime: "application/x-ole-storage",
+    match: (buf) =>
+      buf.length >= 8 &&
+      buf
+        .slice(0, 8)
+        .equals(
+          Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]),
+        ),
+  },
+  {
     mime: "text/plain",
     match: (buf) =>
       buf.length > 0 &&
@@ -201,6 +212,249 @@ export function detectMimeMismatch(
     mismatch: !equivalent && !!detected && detected !== normalizedDeclared,
     declared: normalizedDeclared,
     detected,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Content signature enforcement
+// ---------------------------------------------------------------------------
+
+/**
+ * Detected content types that are acceptable matches for a given declared
+ * MIME type. Office Open XML containers (docx/xlsx) are zip archives and
+ * legacy .doc/.xls files are OLE2 compound documents, so their magic bytes
+ * legitimately differ from the declared type.
+ */
+const SIGNATURE_EQUIVALENCES: Record<string, string[]> = {
+  "image/jpg": ["image/jpeg"],
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": [
+    "application/zip",
+  ],
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [
+    "application/zip",
+  ],
+  "application/msword": ["application/x-ole-storage"],
+  "application/vnd.ms-excel": ["application/x-ole-storage", "application/zip"],
+};
+
+const ARCHIVE_MIME_TYPES = new Set(["application/zip", "application/x-ole-storage"]);
+
+export interface FileSignaturePolicy {
+  /** Declared MIME types the route accepts. */
+  allowedDeclaredTypes: string[];
+  /**
+   * Reject zip/OLE2 container content outright. Use for routes that must
+   * never receive archives (e.g. KYC identity documents).
+   */
+  rejectArchives?: boolean;
+}
+
+export interface FileSignatureInspection {
+  ok: boolean;
+  reason?: string;
+  detectedMimetype: string | null;
+}
+
+/**
+ * Inspect the actual file content (magic bytes) against the route's
+ * declared-type policy. Catches spoofed extensions, polyglot files and
+ * archives smuggled in as allowed document types — checks that the
+ * client-supplied MIME type and extension alone cannot provide.
+ */
+export function inspectFileSignature(
+  file: { originalname?: string; mimetype?: string; buffer: Buffer },
+  policy: FileSignaturePolicy,
+): FileSignatureInspection {
+  const buffer = file.buffer;
+  if (!buffer || buffer.length === 0) {
+    return {
+      ok: false,
+      reason: "Empty file uploaded",
+      detectedMimetype: null,
+    };
+  }
+
+  const declared = (file.mimetype || "").toLowerCase().split(";")[0].trim();
+  if (!policy.allowedDeclaredTypes.includes(declared)) {
+    return {
+      ok: false,
+      reason: `Declared file type "${declared || "unknown"}" is not allowed for this upload`,
+      detectedMimetype: sniffMimeType(buffer),
+    };
+  }
+
+  const detected = sniffMimeType(buffer);
+
+  if (policy.rejectArchives && detected && ARCHIVE_MIME_TYPES.has(detected)) {
+    return {
+      ok: false,
+      reason: "Archives and compound documents are not permitted for this upload",
+      detectedMimetype: detected,
+    };
+  }
+
+  const accepted = new Set<string>([declared]);
+  for (const equivalent of SIGNATURE_EQUIVALENCES[declared] || []) {
+    accepted.add(equivalent);
+  }
+
+  if (!detected || !accepted.has(detected)) {
+    return {
+      ok: false,
+      reason: `File content (${detected || "unknown"}) does not match its declared type (${declared})`,
+      detectedMimetype: detected,
+    };
+  }
+
+  return { ok: true, detectedMimetype: detected };
+}
+
+// ---------------------------------------------------------------------------
+// Archive-bomb detection
+// ---------------------------------------------------------------------------
+
+export interface ArchiveInspectionLimits {
+  maxEntries: number;
+  maxTotalUncompressedBytes: number;
+  maxCompressionRatio: number;
+}
+
+export const DEFAULT_ARCHIVE_INSPECTION_LIMITS: ArchiveInspectionLimits = {
+  maxEntries: 128,
+  maxTotalUncompressedBytes: 100 * 1024 * 1024,
+  maxCompressionRatio: 100,
+};
+
+export interface ArchiveInspection {
+  ok: boolean;
+  reason?: string;
+  entryCount: number;
+  totalUncompressedBytes: number;
+  totalCompressedBytes: number;
+}
+
+const ZIP_LOCAL_HEADER_SIG = Buffer.from([0x50, 0x4b, 0x03, 0x04]);
+const ZIP_CENTRAL_DIR_SIG = Buffer.from([0x50, 0x4b, 0x01, 0x02]);
+const ZIP_EOCD_SIG = Buffer.from([0x50, 0x4b, 0x05, 0x06]);
+const ZIP64_MARKER = 0xffffffff;
+
+/**
+ * Inspect a zip container for archive-bomb characteristics without ever
+ * extracting (and therefore without ever inflating) its contents.
+ *
+ * The central directory always records the true uncompressed size of each
+ * entry, so a small compressed payload claiming gigabytes of decompressed
+ * content — or an entry count large enough to exhaust disk when extracted —
+ * is detected up-front. Zip64 archives are rejected outright because their
+ * sizes cannot be trusted from the 32-bit fields.
+ *
+ * Callers should only run this for buffers whose sniffed type is
+ * `application/zip` (including zip-based office containers such as
+ * docx/xlsx).
+ */
+export function inspectArchiveSafety(
+  buffer: Buffer,
+  limits: ArchiveInspectionLimits = DEFAULT_ARCHIVE_INSPECTION_LIMITS,
+): ArchiveInspection {
+  const empty: ArchiveInspection = {
+    ok: true,
+    entryCount: 0,
+    totalUncompressedBytes: 0,
+    totalCompressedBytes: 0,
+  };
+
+  if (!buffer || buffer.length < 22) return empty;
+
+  const isZip =
+    buffer.length >= 4 &&
+    buffer.slice(0, 4).equals(ZIP_LOCAL_HEADER_SIG);
+  if (!isZip) return empty;
+
+  // Locate the first central directory record.
+  let offset = buffer.indexOf(ZIP_CENTRAL_DIR_SIG);
+  if (offset === -1) {
+    // A zip without a central directory is truncated or malformed; the only
+    // other legal shape is an empty archive (EOCD only).
+    if (buffer.indexOf(ZIP_EOCD_SIG) !== -1) return empty;
+    return {
+      ...empty,
+      ok: false,
+      reason: "Malformed archive: missing central directory",
+    };
+  }
+
+  let entryCount = 0;
+  let totalUncompressedBytes = 0;
+  let totalCompressedBytes = 0;
+
+  while (offset + 46 <= buffer.length) {
+    if (!buffer.slice(offset, offset + 4).equals(ZIP_CENTRAL_DIR_SIG)) break;
+
+    const compressedSize = buffer.readUInt32LE(offset + 20);
+    const uncompressedSize = buffer.readUInt32LE(offset + 24);
+    const filenameLength = buffer.readUInt16LE(offset + 28);
+    const extraLength = buffer.readUInt16LE(offset + 30);
+    const commentLength = buffer.readUInt16LE(offset + 32);
+
+    if (compressedSize === ZIP64_MARKER || uncompressedSize === ZIP64_MARKER) {
+      return {
+        ok: false,
+        reason: "Zip64 archives are not permitted",
+        entryCount,
+        totalUncompressedBytes,
+        totalCompressedBytes,
+      };
+    }
+
+    entryCount += 1;
+    totalUncompressedBytes += uncompressedSize;
+    totalCompressedBytes += compressedSize;
+
+    if (entryCount > limits.maxEntries) {
+      return {
+        ok: false,
+        reason: `Archive contains more than the permitted ${limits.maxEntries} entries`,
+        entryCount,
+        totalUncompressedBytes,
+        totalCompressedBytes,
+      };
+    }
+
+    offset += 46 + filenameLength + extraLength + commentLength;
+  }
+
+  if (totalUncompressedBytes > limits.maxTotalUncompressedBytes) {
+    return {
+      ok: false,
+      reason: `Archive decompresses to more than the permitted ${limits.maxTotalUncompressedBytes} bytes`,
+      entryCount,
+      totalUncompressedBytes,
+      totalCompressedBytes,
+    };
+  }
+
+  // Only flag compression ratios once the decompressed size is large enough
+  // for the ratio to matter; tiny archives routinely have high ratios.
+  const ratio =
+    totalUncompressedBytes / Math.max(totalCompressedBytes, 1);
+  if (
+    totalUncompressedBytes > 1024 * 1024 &&
+    ratio > limits.maxCompressionRatio
+  ) {
+    return {
+      ok: false,
+      reason: `Archive compression ratio ${Math.round(ratio)}:1 exceeds the permitted ${limits.maxCompressionRatio}:1`,
+      entryCount,
+      totalUncompressedBytes,
+      totalCompressedBytes,
+    };
+  }
+
+  return {
+    ok: true,
+    entryCount,
+    totalUncompressedBytes,
+    totalCompressedBytes,
   };
 }
 

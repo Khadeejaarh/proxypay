@@ -67,7 +67,12 @@ import { DisputeService } from "../services/dispute";
 import { DisputeTimelineService } from "../services/disputeTimeline";
 import { DisputeStatus, DisputePriority } from "../models/dispute";
 import { DisputeStateMachine } from "../services/disputeStateMachine";
-import { uploadSingle, uploadMultiple } from "../middleware/disputeUpload";
+import {
+  uploadSingle,
+  uploadMultiple,
+  handleDisputeUploadError,
+} from "../middleware/disputeUpload";
+import { DISPUTE_EVIDENCE_UPLOAD_LIMITS } from "../config/uploadLimits";
 import {
   uploadDisputeEvidenceToS3,
   uploadMultipleDisputeEvidenceToS3,
@@ -844,6 +849,7 @@ disputeRoutes.post(
   requireAuth,
   requirePermission("dispute:update"),
   uploadSingle.single("file"),
+  handleDisputeUploadError,
   async (req: Request, res: Response) => {
     const { disputeId } = req.params;
     const { description } = req.body;
@@ -950,7 +956,8 @@ disputeRoutes.post(
   "/:disputeId/evidence/multiple",
   requireAuth,
   requirePermission("dispute:update"),
-  uploadMultiple.array("files", 5),
+  uploadMultiple.array("files", DISPUTE_EVIDENCE_UPLOAD_LIMITS.maxFiles),
+  handleDisputeUploadError,
   async (req: Request, res: Response) => {
     const { disputeId } = req.params;
     const { descriptions } = req.body;

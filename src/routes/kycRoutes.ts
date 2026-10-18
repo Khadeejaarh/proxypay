@@ -2,13 +2,19 @@ import { NextFunction, Router } from "express";
 import { Pool } from "pg";
 import { KYCController } from "../controllers/kycController";
 import { authenticateToken } from "../middleware/auth";
-import { upload, uploadErrorMessages } from "../middleware/upload";
+import {
+  kycDocumentUpload,
+  handleKycUploadError,
+  uploadErrorMessages,
+} from "../middleware/upload";
 import { uploadToS3 } from "../services/s3Upload";
 import {
   gateUpload,
   linkStoredKey,
   computeSha256,
+  inspectFileSignature,
 } from "../services/fileSecurityService";
+import { KYC_DOCUMENT_UPLOAD_LIMITS } from "../config/uploadLimits";
 import { Request, Response } from "express";
 import { ERROR_CODES } from "../constants/errorCodes";
 import { createError } from "../middleware/errorHandler";
@@ -20,18 +26,11 @@ function validateUploadFile(file: Express.Multer.File): {
   valid: boolean;
   error?: string;
 } {
-  const allowedMimeTypes = [
-    "application/pdf",
-    "image/jpeg",
-    "image/jpg",
-    "image/png",
-  ];
-  const allowedExtensions = [".pdf", ".jpeg", ".jpg", ".png"];
-  const maxSize = 5 * 1024 * 1024;
+  const limits = KYC_DOCUMENT_UPLOAD_LIMITS;
   const filename = String(file.originalname || "").toLowerCase();
 
-  const hasAllowedMimeType = allowedMimeTypes.includes(file.mimetype);
-  const hasAllowedExtension = allowedExtensions.some((ext) =>
+  const hasAllowedMimeType = limits.allowedMimeTypes.includes(file.mimetype);
+  const hasAllowedExtension = limits.allowedExtensions.some((ext) =>
     filename.endsWith(ext),
   );
 
@@ -42,10 +41,23 @@ function validateUploadFile(file: Express.Multer.File): {
     };
   }
 
-  if (file.size > maxSize) {
+  if (file.size > limits.maxFileSizeBytes) {
     return {
       valid: false,
       error: uploadErrorMessages.FILE_TOO_LARGE,
+    };
+  }
+
+  // Inspect the actual content (magic bytes): reject spoofed extensions,
+  // polyglots and archives smuggled in as identity documents.
+  const signature = inspectFileSignature(file, {
+    allowedDeclaredTypes: [...limits.allowedMimeTypes],
+    rejectArchives: true,
+  });
+  if (!signature.ok) {
+    return {
+      valid: false,
+      error: signature.reason || uploadErrorMessages.INVALID_FILE_TYPE,
     };
   }
 
@@ -101,7 +113,8 @@ export const createKYCRoutes = (db: Pool): Router => {
   router.post(
     "/documents/upload",
     annotateDocumentVisibility,
-    upload.single("document"),
+    kycDocumentUpload.single("document"),
+    handleKycUploadError,
     async (req: Request, res: Response) => {
       try {
         const userId = req.jwtUser?.userId;

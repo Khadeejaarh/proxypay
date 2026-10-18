@@ -4,6 +4,7 @@
 
 import { z } from 'zod';
 import { registry } from '../registry';
+import { listTransactionsQuerySchema } from '../../validation/transactionQuerySchemas';
 import {
   TransactionRequestSchema,
   TransactionResponseSchema,
@@ -73,20 +74,20 @@ registry.registerPath({
   path: '/api/v1/transactions',
   tags: [TAG],
   summary: 'List transactions with pagination',
+  description:
+    'Query parameters are validated by the shared runtime schema ' +
+    '(src/validation/transactionQuerySchemas.ts) — the same object ' +
+    'used by validateTransactionFilters.',
   security: SECURITY,
   request: {
-    query: z.object({
-      limit: z.coerce.number().int().positive().max(100).optional().openapi({ example: 20 }),
-      offset: z.coerce.number().int().min(0).optional().openapi({ example: 0 }),
-      before: z.string().optional().openapi({ description: 'Cursor for backward pagination' }),
-      after: z.string().optional().openapi({ description: 'Cursor for forward pagination' }),
-    }),
+    query: listTransactionsQuerySchema,
   },
   responses: {
     200: {
       description: 'Paginated list of transactions',
       content: { 'application/json': { schema: TransactionListResponseSchema } },
     },
+    400: { description: 'Invalid query parameters', content: { 'application/json': { schema: ErrorResponseSchema } } },
     401: { description: 'Unauthorized', content: { 'application/json': { schema: ErrorResponseSchema } } },
   },
 });

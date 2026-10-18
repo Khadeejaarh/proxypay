@@ -1,33 +1,23 @@
 import multer from 'multer';
-import { Request } from 'express';
+import { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import path from 'path';
+import { DISPUTE_EVIDENCE_UPLOAD_LIMITS } from '../config/uploadLimits';
 
 /**
  * Allowed file types for dispute evidence
  */
-const ALLOWED_MIME_TYPES = [
-  'application/pdf',
-  'image/jpeg',
-  'image/jpg', 
-  'image/png',
-  'image/gif',
-  'text/plain',
-  'application/msword',
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  'application/vnd.ms-excel',
-  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-];
+const ALLOWED_MIME_TYPES = [...DISPUTE_EVIDENCE_UPLOAD_LIMITS.allowedMimeTypes];
 
 /**
  * Maximum file size: 10MB
  */
-const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB in bytes
+const MAX_FILE_SIZE = DISPUTE_EVIDENCE_UPLOAD_LIMITS.maxFileSizeBytes;
 
 /**
  * Maximum number of files per upload
  */
-const MAX_FILES = 5;
+const MAX_FILES = DISPUTE_EVIDENCE_UPLOAD_LIMITS.maxFiles;
 
 /**
  * File filter to validate file types
@@ -89,6 +79,8 @@ export const uploadSingle = multer({
   limits: {
     fileSize: MAX_FILE_SIZE,
     files: 1,
+    fields: DISPUTE_EVIDENCE_UPLOAD_LIMITS.maxFields,
+    fieldSize: DISPUTE_EVIDENCE_UPLOAD_LIMITS.maxFieldSizeBytes,
   },
 });
 
@@ -101,8 +93,42 @@ export const uploadMultiple = multer({
   limits: {
     fileSize: MAX_FILE_SIZE,
     files: MAX_FILES,
+    fields: DISPUTE_EVIDENCE_UPLOAD_LIMITS.maxFields,
+    fieldSize: DISPUTE_EVIDENCE_UPLOAD_LIMITS.maxFieldSizeBytes,
   },
 });
+
+/**
+ * Translate multer limit errors on dispute evidence routes into controlled
+ * client errors instead of generic 500s. Place directly after the multer
+ * middleware in the route chain.
+ */
+export const handleDisputeUploadError = (
+  err: Error,
+  _req: Request,
+  res: Response,
+  next: NextFunction,
+): void => {
+  if (err instanceof multer.MulterError) {
+    switch (err.code) {
+      case 'LIMIT_FILE_SIZE':
+        res.status(413).json({ error: disputeUploadErrorMessages.FILE_TOO_LARGE });
+        return;
+      case 'LIMIT_FILE_COUNT':
+        res.status(400).json({ error: disputeUploadErrorMessages.TOO_MANY_FILES });
+        return;
+      case 'LIMIT_UNEXPECTED_FILE':
+        res.status(400).json({
+          error: `Unexpected file field; only "${err.field}" is accepted`,
+        });
+        return;
+      default:
+        res.status(400).json({ error: disputeUploadErrorMessages.UPLOAD_FAILED });
+        return;
+    }
+  }
+  next(err);
+};
 
 /**
  * Error messages for upload validation

@@ -14,6 +14,16 @@ export class FrozenAccountError extends Error {
 }
 
 /**
+ * Returns true when the user exists and their account is active (not frozen,
+ * suspended or soft-deactivated). Used for long-lived connections that outlive
+ * a single HTTP request (WebSocket / GraphQL subscriptions, issue #814).
+ */
+export async function isAccountActive(userId: string): Promise<boolean> {
+  const user = await userModel.findById(userId);
+  return !!user && user.status === "active" && user.isActive !== false;
+}
+
+/**
  * Middleware to check if user account is frozen or suspended
  * This middleware should be called after authentication middleware
  * to ensure req.jwtUser is available

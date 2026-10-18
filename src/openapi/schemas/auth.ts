@@ -1,25 +1,25 @@
 /**
- * Auth domain schemas — derived from src/routes/auth.ts
+ * Auth domain schemas.
+ *
+ * RegisterRequest reuses the runtime validation schema from
+ * src/validation/authSchemas.ts (the exact object the route validates with)
+ * so the documented constraints can never drift from runtime behaviour.
  */
 
 import { z } from 'zod';
 import { registry } from '../registry';
+import { registerSchema } from '../../validation/authSchemas';
 
 export const RegisterRequestSchema = registry.register(
   'RegisterRequest',
-  z
-    .object({
-      phone_number: z.string().min(1).openapi({ example: '+237670000000' }),
-      password: z
-        .string()
-        .min(12)
-        .openapi({
-          example: 'Str0ng!Pass#2024',
-          description:
-            'Minimum 12 characters, must include uppercase, lowercase, and a special character.',
-        }),
-    })
-    .openapi('RegisterRequest'),
+  registerSchema.openapi({
+    example: {
+      phone_number: '+237670000000',
+      password: 'Str0ng!Pass#2024',
+    },
+    description:
+      'Minimum 12 characters, must include uppercase, lowercase, a number, and a special character.',
+  }),
 );
 
 export const LoginRequestSchema = registry.register(

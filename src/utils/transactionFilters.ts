@@ -1,4 +1,5 @@
 import { Request, Response, NextFunction } from "express";
+import { listTransactionsQuerySchema } from "../validation/transactionQuerySchemas";
 
 /**
  * Transaction Status Enum
@@ -178,31 +179,47 @@ export const validateTransactionFilters = (
   next: NextFunction
 ) => {
   try {
-    const { status, limit = 50, offset = 0, reference } = req.query;
+    const { status, limit, offset, reference } = req.query;
 
-    // Validate limit
-    const limitNum = parseInt(limit as string, 10);
-    if (isNaN(limitNum) || limitNum < 1) {
+    // Parse the query through the shared Zod contract so runtime parsing and
+    // the OpenAPI spec are always in sync (issue #812).
+    const parsed = listTransactionsQuerySchema.safeParse({
+      status,
+      limit: limit ?? undefined,
+      offset: offset ?? undefined,
+      reference: reference ?? undefined,
+    });
+
+    if (!parsed.success) {
+      const issue = parsed.error.issues[0];
+      const field = issue?.path?.[0];
+      if (field === "limit") {
+        return res.status(400).json({
+          error: "Invalid limit parameter",
+          message: "limit must be a number between 1 and 1000",
+        });
+      }
+      if (field === "offset") {
+        return res.status(400).json({
+          error: "Invalid offset parameter",
+          message: "offset must be a non-negative number",
+        });
+      }
       return res.status(400).json({
-        error: "Invalid limit parameter",
-        message: "limit must be a number greater than 0",
+        error: "Invalid query parameters",
+        message: issue?.message ?? "Invalid query parameters",
       });
     }
-    const cappedLimit = Math.min(limitNum, 1000);
 
-    // Validate offset
-    const offsetNum = parseInt(offset as string, 10);
-    if (isNaN(offsetNum) || offsetNum < 0) {
-      return res.status(400).json({
-        error: "Invalid offset parameter",
-        message: "offset must be a non-negative number",
-      });
-    }
+    const { limit: cappedLimit, offset: offsetNum, reference: referenceValue } =
+      parsed.data;
 
     // Parse and validate status
     let statuses: TransactionStatus[] = [];
     try {
-      statuses = parseStatusFilter(status as string | undefined);
+      statuses = parseStatusFilter(
+        typeof status === "string" ? status : undefined
+      );
     } catch (error) {
       return res.status(400).json({
         error: "Invalid status parameter",
@@ -216,7 +233,7 @@ export const validateTransactionFilters = (
       statuses,
       limit: cappedLimit,
       offset: offsetNum,
-      reference: reference as string | undefined,
+      reference: referenceValue,
     };
 
     next();

@@ -11,6 +11,11 @@ import {
   type BulkImportJobUpdatedPayload,
   type TypedPubSub,
 } from "./subscriptions";
+import {
+  assertTransactionAccess,
+  assertDisputeAccess,
+  assertBulkImportJobAccess,
+} from "./subscriptionAuth";
 
 // ---------------------------------------------------------------------------
 // Payload formatters
@@ -130,10 +135,19 @@ export function createSubscriptionResolvers(pubsub: TypedPubSub) {
       // Subscribes to a per-transaction Redis channel so only the relevant
       // connection receives the event — no server-side filtering needed.
       transactionUpdated: {
-        subscribe: (_parent: unknown, args: { id: string }, context: any) => {
+        subscribe: async (
+          _parent: unknown,
+          args: { id: string },
+          context: any,
+        ) => {
           // Reject unauthenticated WS connections
           if (!context?.auth?.authenticated) {
             throw new Error("UNAUTHENTICATED: valid authToken required");
+          }
+          // Per-subscription ownership check (issue #814): an id-scoped
+          // subscription requires the subscriber to own the transaction.
+          if (args.id) {
+            await assertTransactionAccess(context, args.id);
           }
           // Enforce per-user connection limit (#627)
           const release = connectionLimitManager.acquire(context.auth.subject ?? context.auth.userId ?? "anonymous");
@@ -215,9 +229,13 @@ export function createSubscriptionResolvers(pubsub: TypedPubSub) {
       // ── disputeUpdated ──────────────────────────────────────────────────
       disputeUpdated: {
         subscribe: withFilter(
-          (_parent: unknown, _args: unknown, context: any) => {
+          async (_parent: unknown, args: { id?: string }, context: any) => {
             if (!context?.auth?.authenticated) {
               throw new Error("UNAUTHENTICATED: valid authToken required");
+            }
+            // Per-subscription ownership check (issue #814)
+            if (args?.id) {
+              await assertDisputeAccess(context, args.id);
             }
             const release = connectionLimitManager.acquire(context.auth.subject ?? context.auth.userId ?? "anonymous");
             const iterator = pubsub.asyncIterator<DisputeUpdatedPayload>(
@@ -237,9 +255,17 @@ export function createSubscriptionResolvers(pubsub: TypedPubSub) {
       // ── disputeNoteAdded ────────────────────────────────────────────────
       disputeNoteAdded: {
         subscribe: withFilter(
-          (_parent: unknown, _args: unknown, context: any) => {
+          async (
+            _parent: unknown,
+            args: { disputeId?: string },
+            context: any,
+          ) => {
             if (!context?.auth?.authenticated) {
               throw new Error("UNAUTHENTICATED: valid authToken required");
+            }
+            // Per-subscription ownership check (issue #814)
+            if (args?.disputeId) {
+              await assertDisputeAccess(context, args.disputeId);
             }
             const release = connectionLimitManager.acquire(context.auth.subject ?? context.auth.userId ?? "anonymous");
             const iterator = pubsub.asyncIterator<DisputeNoteAddedPayload>(
@@ -259,9 +285,17 @@ export function createSubscriptionResolvers(pubsub: TypedPubSub) {
       // ── bulkImportJobUpdated ────────────────────────────────────────────
       bulkImportJobUpdated: {
         subscribe: withFilter(
-          (_parent: unknown, _args: unknown, context: any) => {
+          async (
+            _parent: unknown,
+            args: { jobId?: string },
+            context: any,
+          ) => {
             if (!context?.auth?.authenticated) {
               throw new Error("UNAUTHENTICATED: valid authToken required");
+            }
+            // Per-subscription ownership check (issue #814)
+            if (args?.jobId) {
+              await assertBulkImportJobAccess(context, args.jobId);
             }
             const release = connectionLimitManager.acquire(context.auth.subject ?? context.auth.userId ?? "anonymous");
             const iterator = pubsub.asyncIterator<BulkImportJobUpdatedPayload>(

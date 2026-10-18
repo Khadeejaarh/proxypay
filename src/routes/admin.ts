@@ -406,6 +406,9 @@ router.post(
           }
 
           results.push({ userId, status: "success" });
+
+          // Terminate the user's open WS/subscription sessions (issue #814)
+          await revokeUserSessionsOnStatusChange(userId, "frozen");
         } catch (error) {
           results.push({
             userId,

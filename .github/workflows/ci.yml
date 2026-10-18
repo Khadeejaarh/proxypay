@@ -197,6 +197,10 @@ jobs:
         run: npm run lint
         continue-on-error: false
 
+      - name: OpenAPI contract check
+        run: npm run openapi:check
+        continue-on-error: false
+
       - name: Run tests with coverage
         run: npm run test:coverage -- --maxWorkers=2 --forceExit
         timeout-minutes: 10
