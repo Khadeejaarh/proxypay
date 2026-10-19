@@ -51,6 +51,197 @@ interface HorizonAccountResponse {
   balances: HorizonBalance[];
 }
 
+/**
+ * Resource estimates captured from a Soroban simulation before submission.
+ */
+export interface SorobanResourceEstimate {
+  fee: number;
+  cpuInsns: number;
+  memBytes: number;
+}
+
+/**
+ * Configurable ceilings that bound Soroban simulation/submission.
+ */
+export interface SorobanLimits {
+  maxFee: number;
+  maxCpuInsns: number;
+  maxMemBytes: number;
+  maxRetries: number;
+  baseBackoffMs: number;
+}
+
+/**
+ * Final persisted outcome of a Soroban contract execution for a job.
+ */
+export interface SorobanContractResult {
+  jobId: string;
+  success: boolean;
+  attempts: number;
+  estimate?: SorobanResourceEstimate;
+  error?: string;
+  errorClass?: "retryable" | "terminal";
+  completedAt: string;
+}
+
+export class SorobanResourceLimitError extends Error {
+  readonly estimate: SorobanResourceEstimate;
+  readonly limits: SorobanLimits;
+
+  constructor(estimate: SorobanResourceEstimate, limits: SorobanLimits) {
+    super(
+      `Soroban resource estimate exceeds configured ceilings: ` +
+        `fee ${estimate.fee}/${limits.maxFee}, ` +
+        `cpu ${estimate.cpuInsns}/${limits.maxCpuInsns}, ` +
+        `mem ${estimate.memBytes}/${limits.maxMemBytes}`,
+    );
+    this.name = "SorobanResourceLimitError";
+    this.estimate = estimate;
+    this.limits = limits;
+  }
+}
+
+const getSorobanLimits = (): SorobanLimits => {
+  const env = config as unknown as Record<string, string | number | undefined>;
+  const num = (value: unknown, fallback: number): number => {
+    const parsed = typeof value === "number" ? value : Number(value);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+  };
+  return {
+    maxFee: num(env.sorobanMaxFee, 1_000_000),
+    maxCpuInsns: num(env.sorobanMaxCpuInsns, 100_000_000),
+    maxMemBytes: num(env.sorobanMaxMemBytes, 40_000_000),
+    maxRetries: num(env.sorobanMaxRetries, 3),
+    baseBackoffMs: num(env.sorobanBaseBackoffMs, 500),
+  };
+};
+
+/**
+ * Aborts when a simulation estimate exceeds any configured ceiling.
+ */
+export const enforceSorobanLimits = (
+  estimate: SorobanResourceEstimate,
+  limits: SorobanLimits = getSorobanLimits(),
+): void => {
+  if (
+    estimate.fee > limits.maxFee ||
+    estimate.cpuInsns > limits.maxCpuInsns ||
+    estimate.memBytes > limits.maxMemBytes
+  ) {
+    throw new SorobanResourceLimitError(estimate, limits);
+  }
+};
+
+/**
+ * Classifies a Soroban error as retryable (transient network/ledger issues) or
+ * terminal (resource limits, invalid contract state, auth failures).
+ */
+export const classifySorobanError = (
+  err: unknown,
+): "retryable" | "terminal" => {
+  if (err instanceof SorobanResourceLimitError) {
+    return "terminal";
+  }
+  const message = (err as Error)?.message ?? String(err);
+  const retryablePatterns = [
+    /timeout/i,
+    /timed out/i,
+    /ECONNRESET/i,
+    /ECONNREFUSED/i,
+    /ETIMEDOUT/i,
+    /try again/i,
+    /tx_bad_seq/i,
+    /rate limit/i,
+    /503/,
+    /502/,
+    /504/,
+  ];
+  return retryablePatterns.some((pattern) => pattern.test(message))
+    ? "retryable"
+    : "terminal";
+};
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Runs a Soroban contract execution with bounded retries and backoff.
+ * Captures the simulation estimate, enforces fee/gas ceilings, classifies
+ * errors, and persists the final contract result for the job.
+ */
+export const executeSorobanContract = async (
+  jobId: string,
+  simulate: () => Promise<SorobanResourceEstimate>,
+  submit: (estimate: SorobanResourceEstimate) => Promise<void>,
+  persist: (result: SorobanContractResult) => Promise<void>,
+  limits: SorobanLimits = getSorobanLimits(),
+): Promise<SorobanContractResult> => {
+  let attempts = 0;
+  let estimate: SorobanResourceEstimate | undefined;
+
+  while (attempts <= limits.maxRetries) {
+    attempts += 1;
+    try {
+      estimate = await simulate();
+      enforceSorobanLimits(estimate, limits);
+      await submit(estimate);
+
+      const result: SorobanContractResult = {
+        jobId,
+        success: true,
+        attempts,
+        estimate,
+        completedAt: new Date().toISOString(),
+      };
+      await persist(result);
+      logger.info({ jobId, attempts, estimate }, "Soroban contract executed");
+      return result;
+    } catch (err) {
+      const errorClass = classifySorobanError(err);
+      const message = (err as Error)?.message ?? String(err);
+
+      logger.warn(
+        { jobId, attempts, errorClass, err: message },
+        "Soroban contract execution attempt failed",
+      );
+
+      if (errorClass === "terminal" || attempts > limits.maxRetries) {
+        const result: SorobanContractResult = {
+          jobId,
+          success: false,
+          attempts,
+          estimate,
+          error: message,
+          errorClass,
+          completedAt: new Date().toISOString(),
+        };
+        await persist(result);
+        logger.error(
+          { jobId, attempts, errorClass, err: message },
+          "Soroban contract execution failed terminally",
+        );
+        return result;
+      }
+
+      const backoff = limits.baseBackoffMs * 2 ** (attempts - 1);
+      await sleep(backoff);
+    }
+  }
+
+  // Unreachable in practice; guard against unexpected loop exit.
+  const result: SorobanContractResult = {
+    jobId,
+    success: false,
+    attempts,
+    estimate,
+    error: "Soroban execution exhausted retries",
+    errorClass: "terminal",
+    completedAt: new Date().toISOString(),
+  };
+  await persist(result);
+  return result;
+};
+
 const client = axios.create({
   baseURL: config.bridgeApiUrl,
   headers: {
