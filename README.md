@@ -428,3 +428,8 @@ MIT License — see [LICENSE](LICENSE) file.
 ---
 
 **Built with ❤️ for financial inclusion in Africa**
+
+## Handsoff notes
+
+<!-- handsoff-issue-802 -->
+- #802: Measure and prune redundant indexes
