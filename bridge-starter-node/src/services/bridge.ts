@@ -12,6 +12,45 @@ interface CreatePaymentResponse {
   status: string;
 }
 
+/**
+ * Actionable payout validation states surfaced to callers.
+ */
+export type PayoutValidationState =
+  | "network_mismatch"
+  | "asset_issuer_mismatch"
+  | "asset_code_mismatch"
+  | "missing_trustline"
+  | "trustline_not_authorized"
+  | "account_not_found";
+
+export class PayoutValidationError extends Error {
+  readonly state: PayoutValidationState;
+
+  constructor(state: PayoutValidationState, message: string) {
+    super(message);
+    this.name = "PayoutValidationError";
+    this.state = state;
+  }
+}
+
+interface StellarAssetConfig {
+  network: string;
+  assetCode: string;
+  assetIssuer: string;
+}
+
+interface HorizonBalance {
+  asset_type: string;
+  asset_code?: string;
+  asset_issuer?: string;
+  is_authorized?: boolean;
+  is_authorized_to_maintain_liabilities?: boolean;
+}
+
+interface HorizonAccountResponse {
+  balances: HorizonBalance[];
+}
+
 const client = axios.create({
   baseURL: config.bridgeApiUrl,
   headers: {
@@ -20,6 +59,99 @@ const client = axios.create({
     "Content-Type": "application/json",
   },
 });
+
+const getStellarAssetConfig = (): StellarAssetConfig => {
+  const env = config as unknown as Record<string, string | undefined>;
+  return {
+    network: env.stellarNetwork ?? "",
+    assetCode: env.stellarAssetCode ?? "",
+    assetIssuer: env.stellarAssetIssuer ?? "",
+  };
+};
+
+/**
+ * Validates the configured Stellar network and asset (code/issuer) against the
+ * expected network configuration before any payout is submitted.
+ */
+export const validateStellarAssetConfig = (
+  expected: StellarAssetConfig,
+): void => {
+  const actual = getStellarAssetConfig();
+
+  if (!actual.network || actual.network !== expected.network) {
+    throw new PayoutValidationError(
+      "network_mismatch",
+      `Stellar network mismatch: expected "${expected.network}", got "${actual.network}"`,
+    );
+  }
+
+  if (!actual.assetCode || actual.assetCode !== expected.assetCode) {
+    throw new PayoutValidationError(
+      "asset_code_mismatch",
+      `Stellar asset code mismatch: expected "${expected.assetCode}", got "${actual.assetCode}"`,
+    );
+  }
+
+  if (!actual.assetIssuer || actual.assetIssuer !== expected.assetIssuer) {
+    throw new PayoutValidationError(
+      "asset_issuer_mismatch",
+      `Stellar asset issuer mismatch: expected "${expected.assetIssuer}", got "${actual.assetIssuer}"`,
+    );
+  }
+};
+
+/**
+ * Fetches the destination account from Horizon and verifies it holds an
+ * authorized trustline for the configured asset before a payout is submitted.
+ */
+export const validateDestinationTrustline = async (
+  destination: string,
+  horizonUrl: string,
+): Promise<void> => {
+  const { assetCode, assetIssuer } = getStellarAssetConfig();
+
+  let account: HorizonAccountResponse;
+  try {
+    const response = await axios.get<HorizonAccountResponse>(
+      `${horizonUrl.replace(/\/$/, "")}/accounts/${destination}`,
+    );
+    account = response.data;
+  } catch (err) {
+    const axiosErr = err as AxiosError;
+    if (axiosErr.response?.status === 404) {
+      throw new PayoutValidationError(
+        "account_not_found",
+        `Destination account ${destination} does not exist on the Stellar network`,
+      );
+    }
+    throw err;
+  }
+
+  const trustline = account.balances.find(
+    (balance) =>
+      balance.asset_type !== "native" &&
+      balance.asset_code === assetCode &&
+      balance.asset_issuer === assetIssuer,
+  );
+
+  if (!trustline) {
+    throw new PayoutValidationError(
+      "missing_trustline",
+      `Destination ${destination} has no trustline for ${assetCode}:${assetIssuer}`,
+    );
+  }
+
+  const authorized =
+    trustline.is_authorized === true ||
+    trustline.is_authorized_to_maintain_liabilities === true;
+
+  if (!authorized) {
+    throw new PayoutValidationError(
+      "trustline_not_authorized",
+      `Destination ${destination} trustline for ${assetCode}:${assetIssuer} is not authorized`,
+    );
+  }
+};
 
 /**
  * Creates a payment via the Bridge API.
