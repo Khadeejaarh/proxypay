@@ -428,3 +428,8 @@ MIT License — see [LICENSE](LICENSE) file.
 ---
 
 **Built with ❤️ for financial inclusion in Africa**
+
+## Handsoff notes
+
+<!-- handsoff-issue-777 -->
+- #777: Do not silently turn GDPR query failures into empty exports
