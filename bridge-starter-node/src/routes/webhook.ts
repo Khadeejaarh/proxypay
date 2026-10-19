@@ -1,4 +1,4 @@
-import { Router, Request, Response } from "express";
+import { Router, Request, Response, NextFunction } from "express";
 import { verifyWebhookSignature } from "../middleware/verifySignature";
 import { WebhookEvent, PaymentData } from "../types/webhook";
 import logger from "../logger";
@@ -8,8 +8,18 @@ const router = Router();
 router.post(
   "/webhook",
   verifyWebhookSignature,
-  (req: Request, res: Response) => {
+  (req: Request, res: Response, next: NextFunction) => {
     const event = req.body as WebhookEvent<PaymentData>;
+
+    if (!event || typeof event.type !== "string") {
+      const err = new Error("Invalid webhook payload") as Error & {
+        code?: string;
+        status?: number;
+      };
+      err.code = "INVALID_WEBHOOK_PAYLOAD";
+      err.status = 400;
+      return next(err);
+    }
 
     logger.info(
       { eventType: event.type },
