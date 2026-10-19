@@ -4,6 +4,7 @@ import { requireRole } from '../middleware/rbac';
 import { TimeoutPresets, haltOnTimedout } from '../middleware/timeout';
 import { InvoiceModel, InvoiceStatus, type Invoice } from '../models/invoice';
 import logger from '../utils/logger';
+import { s3Service } from '../services/s3';
 
 const invoiceRoutes = Router();
 const invoiceModel = new InvoiceModel();
@@ -94,11 +95,27 @@ invoiceRoutes.get(
         return res.status(400).json({ error: 'Invoice PDF not available' });
       }
 
-      // TODO: Fetch PDF from storage (S3, etc.)
-      // For now, return placeholder
+      let pdf: Buffer;
+      try {
+        pdf = await s3Service.getObject(invoice.pdfStorageKey);
+      } catch (storageErr) {
+        logger.error(
+          { error: storageErr, invoiceId: id, storageKey: invoice.pdfStorageKey },
+          'Failed to retrieve invoice PDF from storage'
+        );
+        return res.status(502).json({ error: 'Invoice PDF could not be retrieved from storage' });
+      }
+
+      if (!pdf || pdf.length === 0) {
+        return res.status(404).json({ error: 'Invoice PDF not found in storage' });
+      }
+
+      const safeFilename = `${String(invoice.invoiceNumber).replace(/[^A-Za-z0-9._-]/g, '_')}.pdf`;
+
       res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Disposition', `attachment; filename="${invoice.invoiceNumber}.pdf"`);
-      res.status(200).send(Buffer.from('PDF content placeholder'));
+      res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
+      res.setHeader('Content-Length', String(pdf.length));
+      res.status(200).send(pdf);
     } catch (err) {
       logger.error({ error: err }, 'Failed to download invoice');
       res.status(500).json({ error: 'Failed to download invoice' });
