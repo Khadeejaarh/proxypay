@@ -428,3 +428,8 @@ MIT License — see [LICENSE](LICENSE) file.
 ---
 
 **Built with ❤️ for financial inclusion in Africa**
+
+## Handsoff notes
+
+<!-- handsoff-issue-790 -->
+- #790: Enforce quote expiry and rate provenance for SEP-38
