@@ -1,0 +1,57 @@
+groups:
+  - name: horizon-failover
+    rules:
+      # Sustained degraded availability: no healthy Horizon endpoint for a while.
+      - alert: HorizonNoHealthyEndpoints
+        expr: sum(horizon_endpoint_healthy) == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No healthy Horizon endpoints"
+          description: "All configured Horizon endpoints have been unhealthy for more than 2 minutes; failover cannot recover availability."
+
+      # Degraded quorum: fewer than half of endpoints healthy for a sustained period.
+      - alert: HorizonDegradedQuorum
+        expr: |
+          sum(horizon_endpoint_healthy)
+            < (count(horizon_endpoint_healthy) / 2)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Horizon endpoint quorum degraded"
+          description: "Fewer than half of the configured Horizon endpoints are healthy for more than 5 minutes."
+
+      # Repeated failover: active endpoint keeps changing.
+      - alert: HorizonRepeatedFailover
+        expr: |
+          changes(horizon_active_endpoint[15m]) > 3
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Horizon endpoint failover is flapping"
+          description: "The active Horizon endpoint changed more than 3 times in the last 15 minutes, indicating repeated failover."
+
+      # Endpoint stuck in cooldown for an extended period.
+      - alert: HorizonEndpointCooldownStuck
+        expr: |
+          max by (endpoint) (horizon_endpoint_cooldown) == 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Horizon endpoint {{ $labels.endpoint }} stuck in cooldown"
+          description: "Horizon endpoint {{ $labels.endpoint }} has remained in cooldown for more than 10 minutes."
+
+      # Elevated per-endpoint failure counts.
+      - alert: HorizonEndpointHighFailures
+        expr: |
+          increase(horizon_endpoint_failures_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Horizon endpoint {{ $labels.endpoint }} failing repeatedly"
+          description: "Horizon endpoint {{ $labels.endpoint }} has accumulated more than 10 failures in the last 5 minutes."
