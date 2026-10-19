@@ -428,3 +428,8 @@ MIT License — see [LICENSE](LICENSE) file.
 ---
 
 **Built with ❤️ for financial inclusion in Africa**
+
+## Handsoff notes
+
+<!-- handsoff-issue-781 -->
+- #781: Retry external object deletion after database purge
