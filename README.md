@@ -433,3 +433,6 @@ MIT License — see [LICENSE](LICENSE) file.
 
 <!-- handsoff-issue-785 -->
 - #785: Add end-to-end SEP-06 transfer lifecycle tests
+
+<!-- handsoff-issue-788 -->
+- #788: Persist SEP-24 interactive transfer sessions durably
