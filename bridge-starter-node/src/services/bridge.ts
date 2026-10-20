@@ -12,6 +12,236 @@ interface CreatePaymentResponse {
   status: string;
 }
 
+/**
+ * Actionable payout validation states surfaced to callers.
+ */
+export type PayoutValidationState =
+  | "network_mismatch"
+  | "asset_issuer_mismatch"
+  | "asset_code_mismatch"
+  | "missing_trustline"
+  | "trustline_not_authorized"
+  | "account_not_found";
+
+export class PayoutValidationError extends Error {
+  readonly state: PayoutValidationState;
+
+  constructor(state: PayoutValidationState, message: string) {
+    super(message);
+    this.name = "PayoutValidationError";
+    this.state = state;
+  }
+}
+
+interface StellarAssetConfig {
+  network: string;
+  assetCode: string;
+  assetIssuer: string;
+}
+
+interface HorizonBalance {
+  asset_type: string;
+  asset_code?: string;
+  asset_issuer?: string;
+  is_authorized?: boolean;
+  is_authorized_to_maintain_liabilities?: boolean;
+}
+
+interface HorizonAccountResponse {
+  balances: HorizonBalance[];
+}
+
+/**
+ * Resource estimates captured from a Soroban simulation before submission.
+ */
+export interface SorobanResourceEstimate {
+  fee: number;
+  cpuInsns: number;
+  memBytes: number;
+}
+
+/**
+ * Configurable ceilings that bound Soroban simulation/submission.
+ */
+export interface SorobanLimits {
+  maxFee: number;
+  maxCpuInsns: number;
+  maxMemBytes: number;
+  maxRetries: number;
+  baseBackoffMs: number;
+}
+
+/**
+ * Final persisted outcome of a Soroban contract execution for a job.
+ */
+export interface SorobanContractResult {
+  jobId: string;
+  success: boolean;
+  attempts: number;
+  estimate?: SorobanResourceEstimate;
+  error?: string;
+  errorClass?: "retryable" | "terminal";
+  completedAt: string;
+}
+
+export class SorobanResourceLimitError extends Error {
+  readonly estimate: SorobanResourceEstimate;
+  readonly limits: SorobanLimits;
+
+  constructor(estimate: SorobanResourceEstimate, limits: SorobanLimits) {
+    super(
+      `Soroban resource estimate exceeds configured ceilings: ` +
+        `fee ${estimate.fee}/${limits.maxFee}, ` +
+        `cpu ${estimate.cpuInsns}/${limits.maxCpuInsns}, ` +
+        `mem ${estimate.memBytes}/${limits.maxMemBytes}`,
+    );
+    this.name = "SorobanResourceLimitError";
+    this.estimate = estimate;
+    this.limits = limits;
+  }
+}
+
+const getSorobanLimits = (): SorobanLimits => {
+  const env = config as unknown as Record<string, string | number | undefined>;
+  const num = (value: unknown, fallback: number): number => {
+    const parsed = typeof value === "number" ? value : Number(value);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+  };
+  return {
+    maxFee: num(env.sorobanMaxFee, 1_000_000),
+    maxCpuInsns: num(env.sorobanMaxCpuInsns, 100_000_000),
+    maxMemBytes: num(env.sorobanMaxMemBytes, 40_000_000),
+    maxRetries: num(env.sorobanMaxRetries, 3),
+    baseBackoffMs: num(env.sorobanBaseBackoffMs, 500),
+  };
+};
+
+/**
+ * Aborts when a simulation estimate exceeds any configured ceiling.
+ */
+export const enforceSorobanLimits = (
+  estimate: SorobanResourceEstimate,
+  limits: SorobanLimits = getSorobanLimits(),
+): void => {
+  if (
+    estimate.fee > limits.maxFee ||
+    estimate.cpuInsns > limits.maxCpuInsns ||
+    estimate.memBytes > limits.maxMemBytes
+  ) {
+    throw new SorobanResourceLimitError(estimate, limits);
+  }
+};
+
+/**
+ * Classifies a Soroban error as retryable (transient network/ledger issues) or
+ * terminal (resource limits, invalid contract state, auth failures).
+ */
+export const classifySorobanError = (
+  err: unknown,
+): "retryable" | "terminal" => {
+  if (err instanceof SorobanResourceLimitError) {
+    return "terminal";
+  }
+  const message = (err as Error)?.message ?? String(err);
+  const retryablePatterns = [
+    /timeout/i,
+    /timed out/i,
+    /ECONNRESET/i,
+    /ECONNREFUSED/i,
+    /ETIMEDOUT/i,
+    /try again/i,
+    /tx_bad_seq/i,
+    /rate limit/i,
+    /503/,
+    /502/,
+    /504/,
+  ];
+  return retryablePatterns.some((pattern) => pattern.test(message))
+    ? "retryable"
+    : "terminal";
+};
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Runs a Soroban contract execution with bounded retries and backoff.
+ * Captures the simulation estimate, enforces fee/gas ceilings, classifies
+ * errors, and persists the final contract result for the job.
+ */
+export const executeSorobanContract = async (
+  jobId: string,
+  simulate: () => Promise<SorobanResourceEstimate>,
+  submit: (estimate: SorobanResourceEstimate) => Promise<void>,
+  persist: (result: SorobanContractResult) => Promise<void>,
+  limits: SorobanLimits = getSorobanLimits(),
+): Promise<SorobanContractResult> => {
+  let attempts = 0;
+  let estimate: SorobanResourceEstimate | undefined;
+
+  while (attempts <= limits.maxRetries) {
+    attempts += 1;
+    try {
+      estimate = await simulate();
+      enforceSorobanLimits(estimate, limits);
+      await submit(estimate);
+
+      const result: SorobanContractResult = {
+        jobId,
+        success: true,
+        attempts,
+        estimate,
+        completedAt: new Date().toISOString(),
+      };
+      await persist(result);
+      logger.info({ jobId, attempts, estimate }, "Soroban contract executed");
+      return result;
+    } catch (err) {
+      const errorClass = classifySorobanError(err);
+      const message = (err as Error)?.message ?? String(err);
+
+      logger.warn(
+        { jobId, attempts, errorClass, err: message },
+        "Soroban contract execution attempt failed",
+      );
+
+      if (errorClass === "terminal" || attempts > limits.maxRetries) {
+        const result: SorobanContractResult = {
+          jobId,
+          success: false,
+          attempts,
+          estimate,
+          error: message,
+          errorClass,
+          completedAt: new Date().toISOString(),
+        };
+        await persist(result);
+        logger.error(
+          { jobId, attempts, errorClass, err: message },
+          "Soroban contract execution failed terminally",
+        );
+        return result;
+      }
+
+      const backoff = limits.baseBackoffMs * 2 ** (attempts - 1);
+      await sleep(backoff);
+    }
+  }
+
+  // Unreachable in practice; guard against unexpected loop exit.
+  const result: SorobanContractResult = {
+    jobId,
+    success: false,
+    attempts,
+    estimate,
+    error: "Soroban execution exhausted retries",
+    errorClass: "terminal",
+    completedAt: new Date().toISOString(),
+  };
+  await persist(result);
+  return result;
+};
+
 const client = axios.create({
   baseURL: config.bridgeApiUrl,
   headers: {
@@ -20,6 +250,99 @@ const client = axios.create({
     "Content-Type": "application/json",
   },
 });
+
+const getStellarAssetConfig = (): StellarAssetConfig => {
+  const env = config as unknown as Record<string, string | undefined>;
+  return {
+    network: env.stellarNetwork ?? "",
+    assetCode: env.stellarAssetCode ?? "",
+    assetIssuer: env.stellarAssetIssuer ?? "",
+  };
+};
+
+/**
+ * Validates the configured Stellar network and asset (code/issuer) against the
+ * expected network configuration before any payout is submitted.
+ */
+export const validateStellarAssetConfig = (
+  expected: StellarAssetConfig,
+): void => {
+  const actual = getStellarAssetConfig();
+
+  if (!actual.network || actual.network !== expected.network) {
+    throw new PayoutValidationError(
+      "network_mismatch",
+      `Stellar network mismatch: expected "${expected.network}", got "${actual.network}"`,
+    );
+  }
+
+  if (!actual.assetCode || actual.assetCode !== expected.assetCode) {
+    throw new PayoutValidationError(
+      "asset_code_mismatch",
+      `Stellar asset code mismatch: expected "${expected.assetCode}", got "${actual.assetCode}"`,
+    );
+  }
+
+  if (!actual.assetIssuer || actual.assetIssuer !== expected.assetIssuer) {
+    throw new PayoutValidationError(
+      "asset_issuer_mismatch",
+      `Stellar asset issuer mismatch: expected "${expected.assetIssuer}", got "${actual.assetIssuer}"`,
+    );
+  }
+};
+
+/**
+ * Fetches the destination account from Horizon and verifies it holds an
+ * authorized trustline for the configured asset before a payout is submitted.
+ */
+export const validateDestinationTrustline = async (
+  destination: string,
+  horizonUrl: string,
+): Promise<void> => {
+  const { assetCode, assetIssuer } = getStellarAssetConfig();
+
+  let account: HorizonAccountResponse;
+  try {
+    const response = await axios.get<HorizonAccountResponse>(
+      `${horizonUrl.replace(/\/$/, "")}/accounts/${destination}`,
+    );
+    account = response.data;
+  } catch (err) {
+    const axiosErr = err as AxiosError;
+    if (axiosErr.response?.status === 404) {
+      throw new PayoutValidationError(
+        "account_not_found",
+        `Destination account ${destination} does not exist on the Stellar network`,
+      );
+    }
+    throw err;
+  }
+
+  const trustline = account.balances.find(
+    (balance) =>
+      balance.asset_type !== "native" &&
+      balance.asset_code === assetCode &&
+      balance.asset_issuer === assetIssuer,
+  );
+
+  if (!trustline) {
+    throw new PayoutValidationError(
+      "missing_trustline",
+      `Destination ${destination} has no trustline for ${assetCode}:${assetIssuer}`,
+    );
+  }
+
+  const authorized =
+    trustline.is_authorized === true ||
+    trustline.is_authorized_to_maintain_liabilities === true;
+
+  if (!authorized) {
+    throw new PayoutValidationError(
+      "trustline_not_authorized",
+      `Destination ${destination} trustline for ${assetCode}:${assetIssuer} is not authorized`,
+    );
+  }
+};
 
 /**
  * Creates a payment via the Bridge API.
@@ -70,4 +393,148 @@ export const createPayment = async (
 
     throw err;
   }
+};
+
+/**
+ * Queries the provider status API for an existing payout by reference.
+ * Returns null when the provider has no record of the payout.
+ */
+export const getPaymentByReference = async (
+  reference: string,
+): Promise<PaymentStatusResponse | null> => {
+  try {
+    const response = await client.get<PaymentStatusResponse>(
+      `/payments/by-reference/${encodeURIComponent(reference)}`,
+    );
+    return response.data;
+  } catch (err) {
+    const axiosErr = err as AxiosError;
+    if (axiosErr.response?.status === 404) {
+      return null;
+    }
+    throw err;
+  }
+};
+
+/**
+ * Idempotent SEP-31 payout submission.
+ *
+ * 1. Persists a unique transaction reference before any external call.
+ * 2. On ambiguous failures (timeouts / unknown responses), queries the
+ *    provider status API to determine whether the payout already exists
+ *    before retrying.
+ * 3. Reconciles the persisted reference with the provider payment id so
+ *    duplicate/out-of-order completion callbacks cannot create a second
+ *    payout.
+ */
+export const submitSep31Payout = async (
+  store: Sep31TransactionStore,
+  reference: string,
+  payload: CreatePaymentPayload,
+): Promise<Sep31TransactionRecord> => {
+  // Persist the reference first. A duplicate reference means another attempt
+  // already owns this payout — reconcile against it instead of resubmitting.
+  let record = await store.findByReference(reference);
+  if (!record) {
+    try {
+      await store.create({ reference, status: "pending" });
+      record = { reference, status: "pending" };
+    } catch (err) {
+      // Uniqueness constraint hit: another attempt persisted it concurrently.
+      record = await store.findByReference(reference);
+      if (!record) {
+        throw err;
+      }
+    }
+  }
+
+  // Already submitted or completed — never submit a second payout.
+  if (record.status === "submitted" || record.status === "completed") {
+    return record;
+  }
+
+  try {
+    const payment = await createPayment(payload);
+    record = {
+      reference,
+      status: "submitted",
+      providerPaymentId: payment.id,
+    };
+    await store.update(record);
+    return record;
+  } catch (err) {
+    const axiosErr = err as AxiosError;
+    const status = axiosErr.response?.status;
+    const ambiguous = !status || status >= 500 || axiosErr.code === "ECONNABORTED";
+
+    if (!ambiguous) {
+      // Definite rejection — safe to mark failed.
+      record = { ...record, status: "failed" };
+      await store.update(record);
+      throw err;
+    }
+
+    // Ambiguous failure: query provider state before deciding to retry.
+    logger.warn(
+      { reference, status, code: axiosErr.code },
+      "Ambiguous payout failure; reconciling with provider status",
+    );
+
+    const existing = await getPaymentByReference(reference);
+    if (existing) {
+      record = {
+        reference,
+        status: "submitted",
+        providerPaymentId: existing.id,
+      };
+      await store.update(record);
+      return record;
+    }
+
+    // Provider has no record — safe to retry once.
+    const payment = await createPayment(payload);
+    record = {
+      reference,
+      status: "submitted",
+      providerPaymentId: payment.id,
+    };
+    await store.update(record);
+    return record;
+  }
+};
+
+/**
+ * Reconciles a completion callback against the persisted reference.
+ * Duplicate or out-of-order callbacks are ignored once the payout is
+ * already completed, preventing a second payout from being created.
+ */
+export const reconcileSep31Callback = async (
+  store: Sep31TransactionStore,
+  reference: string,
+  providerPaymentId: string,
+): Promise<Sep31TransactionRecord> => {
+  const record = await store.findByReference(reference);
+  if (!record) {
+    throw new Error(`Unknown SEP-31 reference: ${reference}`);
+  }
+
+  if (record.status === "completed") {
+    return record;
+  }
+
+  if (record.providerPaymentId && record.providerPaymentId !== providerPaymentId) {
+    logger.warn(
+      { reference, expected: record.providerPaymentId, received: providerPaymentId },
+      "Ignoring callback with mismatched provider payment id",
+    );
+    return record;
+  }
+
+  const updated: Sep31TransactionRecord = {
+    ...record,
+    status: "completed",
+    providerPaymentId: record.providerPaymentId ?? providerPaymentId,
+  };
+  await store.update(updated);
+  return updated;
 };

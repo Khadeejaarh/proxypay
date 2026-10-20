@@ -281,6 +281,70 @@ export async function disconnectRedis(): Promise<void> {
 
 export { redisClient };
 
+/**
+ * Atomically evaluates a velocity limit and records the event in a single
+ * Redis round-trip. Concurrent requests can no longer both observe a count
+ * below the threshold before either records its event, because the check and
+ * the increment happen inside one Lua script executed atomically by Redis.
+ *
+ * The counter key is given a TTL so stale state expires automatically. On any
+ * Redis error the check fails closed (allowed=false) so a degraded cache can
+ * never silently let traffic bypass the limit.
+ */
+export type VelocityCheckResult = {
+  allowed: boolean;
+  count: number;
+  limit: number;
+  ttlSeconds: number;
+};
+
+const VELOCITY_LUA = `
+local current = redis.call('INCR', KEYS[1])
+if current == 1 then
+  redis.call('EXPIRE', KEYS[1], ARGV[2])
+end
+local limit = tonumber(ARGV[1])
+if current > limit then
+  return {0, current}
+end
+return {1, current}
+`;
+
+export async function checkAndRecordVelocity(
+  key: string,
+  limit: number,
+  windowSeconds: number,
+): Promise<VelocityCheckResult> {
+  const ttlSeconds = Math.max(1, Math.floor(windowSeconds));
+  const maxAllowed = Math.max(0, Math.floor(limit));
+
+  if (!redisClient.isOpen) {
+    // Fail closed: without Redis we cannot guarantee atomicity.
+    return { allowed: false, count: 0, limit: maxAllowed, ttlSeconds };
+  }
+
+  try {
+    const response = (await redisClient.eval(VELOCITY_LUA, {
+      keys: [key],
+      arguments: [String(maxAllowed), String(ttlSeconds)],
+    })) as unknown;
+
+    if (!Array.isArray(response) || response.length < 2) {
+      return { allowed: false, count: 0, limit: maxAllowed, ttlSeconds };
+    }
+
+    const allowed = Number(response[0]) === 1;
+    const count = Number(response[1]);
+    return { allowed, count, limit: maxAllowed, ttlSeconds };
+  } catch (error) {
+    console.error("Redis: atomic velocity check failed (failing closed)", {
+      key,
+      error,
+    });
+    return { allowed: false, count: 0, limit: maxAllowed, ttlSeconds };
+  }
+}
+
 export function createRedisStore() {
   return new RedisStore({
     client: redisClient,
@@ -292,25 +356,6 @@ export async function flushUserSessions(userId: string): Promise<void> {
   if (!redisClient.isOpen) return;
   
   try {
-    // 1. Set invalidation timestamp to instantly reject active stateless JWTs
-    const now = Math.floor(Date.now() / 1000);
-    await redisClient.set(`user:${userId}:jwt_invalidated_at`, now.toString());
+    // 1. Set in
 
-    // 2. Scan and destroy all express-sessions tied to this user
-    let cursor = "0";
-    do {
-      const reply = await redisClient.scan(cursor, { MATCH: "session:*", COUNT: 100 });
-      cursor = String(reply.cursor);
-      
-      for (const key of reply.keys) {
-        const sessionData = await redisClient.get(key);
-        // Fast check: if the stringified session JSON contains the userId
-        if (sessionData && (sessionData.includes(`"userId":"${userId}"`) || sessionData.includes(`"user_id":"${userId}"`))) {
-          await redisClient.del(key);
-        }
-      }
-    } while (cursor !== "0");
-  } catch (error) {
-    console.error(`Redis: Failed to flush sessions for user ${userId}`, error);
-  }
-}
+/* … truncated 906 chars — edit only what you need near the top … */
