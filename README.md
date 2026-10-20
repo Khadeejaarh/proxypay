@@ -431,5 +431,5 @@ MIT License — see [LICENSE](LICENSE) file.
 
 ## Handsoff notes
 
-<!-- handsoff-issue-790 -->
-- #790: Enforce quote expiry and rate provenance for SEP-38
+<!-- handsoff-issue-802 -->
+- #802: Measure and prune redundant indexes

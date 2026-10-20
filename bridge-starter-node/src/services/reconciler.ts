@@ -25,16 +25,58 @@ import type {
   ReconciliationReport,
 } from "../types/reconciliation";
 
+// ─── Transaction / consistency boundary ──────────────────────────────────────
+
+/**
+ * Minimal transaction client contract.
+ *
+ * Callers that already hold an open transaction (or a primary-routed
+ * connection) can pass it in so that reads stay inside the caller's
+ * transaction and consistency boundary instead of being routed to a
+ * possibly-lagging replica.
+ */
+export interface TransactionClient {
+  /** Execute a query against this client's connection. */
+  query<T = unknown>(sql: string, params?: unknown[]): Promise<{ rows: T[] }>;
+}
+
+/**
+ * Options controlling where reads are served from.
+ *
+ * `client` pins reads to the caller's transaction. `primary` forces
+ * read-after-write operations onto the primary so replica routing cannot
+ * serve stale data.
+ */
+export interface ReadOptions {
+  client?: TransactionClient;
+  primary?: boolean;
+}
+
 // ─── Data-source adapters (replace with real implementations) ────────────────
 
 /**
  * Fetch payout records from the local data store.
  *
- * Replace this stub with a real database / file query.
+ * Replace this stub with a real database / file query. When `options.client`
+ * is supplied the read must run on that client so it observes writes made
+ * earlier in the same transaction. When `options.primary` is set the read
+ * must be routed to the primary (read-after-write).
  */
-export async function fetchLocalPayouts(): Promise<LocalPayoutRecord[]> {
+export async function fetchLocalPayouts(
+  options: ReadOptions = {}
+): Promise<LocalPayoutRecord[]> {
   // TODO: Replace with your actual local data source (database, CSV, etc.)
-  console.log("[reconciler] Fetching local payout records …");
+  if (options.client) {
+    // Read inside the caller's transaction boundary.
+    const { rows } = await options.client.query<LocalPayoutRecord>(
+      "SELECT id, status, amount FROM payouts"
+    );
+    return rows;
+  }
+
+  console.log(
+    `[reconciler] Fetching local payout records … (primary=${!!options.primary})`
+  );
   return [];
 }
 
@@ -306,9 +348,18 @@ function compareRecords(
  * 2. Index both by payout ID.
  * 3. Walk the union of IDs and compare each pair.
  * 4. Return an aggregate `ReconciliationReport`.
+ *
+ * Reconciliation reads local state that may have just been written, so the
+ * local read is pinned to the primary (read-after-write) unless the caller
+ * supplies an explicit transaction client.
  */
-export async function reconcile(): Promise<ReconciliationReport> {
-  const localPayouts = await fetchLocalPayouts();
+export async function reconcile(
+  options: ReadOptions = {}
+): Promise<ReconciliationReport> {
+  const localPayouts = await fetchLocalPayouts({
+    client: options.client,
+    primary: options.client ? options.primary : true,
+  });
   const remotePayouts = await fetchRemotePayouts();
 
   // Index by ID for O(1) lookups
