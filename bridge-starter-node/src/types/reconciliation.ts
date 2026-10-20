@@ -11,6 +11,39 @@ export type PayoutStatus =
   | "missing_local"
   | "missing_remote";
 
+/**
+ * Consistency boundary for a read.
+ *
+ * - `primary`: force the read onto the primary so it observes preceding writes
+ *   in the same workflow (read-after-write).
+ * - `replica`: allow the read to be served by a read replica.
+ */
+export type ReadConsistency = "primary" | "replica";
+
+/**
+ * Opaque transaction client handle. Query helpers accept this so reads stay
+ * inside the caller's transaction boundary instead of opening a new
+ * connection (which could be routed to a replica).
+ */
+export interface TransactionClient {
+  /** Marker used to distinguish a transaction client from a pool client. */  readonly __transactionClient: true;
+}
+
+/** Options accepted by read helpers to control routing and transaction scope. */
+export interface ReadOptions {
+  /**
+   * Explicit transaction client. When provided, the read runs inside the
+   * caller's transaction and is never routed to a replica.
+   */
+  client?: TransactionClient;
+  /**
+   * Consistency boundary for the read. Defaults to `replica` when no
+   * transaction client is supplied. Read-after-write operations must set
+   * this to `primary`.
+   */
+  consistency?: ReadConsistency;
+}
+
 /** A payout record as stored in the local ledger. */
 export interface LocalPayoutRecord {
   /** Unique payout / transaction ID. */
