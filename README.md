@@ -47,6 +47,9 @@ transaction, so application pool sizes can be larger. Set
   PgBouncer server pool. Keep `DB_POOL_MAX` and `DB_WRITE_POOL_MAX` conservative
   and set `DB_CONNECTION_BUDGET` to the PgBouncer server pool size.
 
-Avoid mixing transaction pooling with session-level features (prepared
-statements, advisory locks held across statements) unless PgBouncer is
-configured to support them.
+**Built with ❤️ for financial inclusion in Africa**
+
+## Handsoff notes
+
+<!-- handsoff-issue-781 -->
+- #781: Retry external object deletion after database purge
