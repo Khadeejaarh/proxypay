@@ -431,5 +431,5 @@ MIT License — see [LICENSE](LICENSE) file.
 
 ## Handsoff notes
 
-<!-- handsoff-issue-776 -->
-- #776: Make deactivation cleanup transactional
+<!-- handsoff-issue-771 -->
+- #771: Calibrate fraud score thresholds from measured outcomes
