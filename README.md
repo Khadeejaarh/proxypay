@@ -431,5 +431,5 @@ MIT License — see [LICENSE](LICENSE) file.
 
 ## Handsoff notes
 
-<!-- handsoff-issue-777 -->
-- #777: Do not silently turn GDPR query failures into empty exports
+<!-- handsoff-issue-790 -->
+- #790: Enforce quote expiry and rate provenance for SEP-38
