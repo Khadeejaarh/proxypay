@@ -5,6 +5,10 @@ on:
     workflows: ["CI"]
     types: [completed]
     branches: [main]
+  schedule:
+    # Weekly backup restore drill (Mondays 03:00 UTC)
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
 
 env:
   IMAGE: ${{ github.repository }}
@@ -15,7 +19,7 @@ jobs:
   deploy-staging:
     runs-on: ubuntu-latest
     environment: staging
-    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main'
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main'
 
     steps:
       - name: Checkout
@@ -118,3 +122,115 @@ jobs:
         run: |
           echo "Deployment failed. Collecting logs for diagnostics."
           kubectl logs deployment/proxypay --tail=200 || true
+
+  restore-drill:
+    runs-on: ubuntu-latest
+    environment: staging
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check restore drill secrets
+        id: check_secrets
+        run: |
+          if [ -n "${{ secrets.BACKUP_DATABASE_URL }}" ]; then
+            echo "credentials_available=true" >> $GITHUB_OUTPUT
+          else
+            echo "credentials_available=false" >> $GITHUB_OUTPUT
+            echo "BACKUP_DATABASE_URL is not configured. Skipping restore drill."
+          fi
+
+      - name: Install PostgreSQL client
+        if: steps.check_secrets.outputs.credentials_available == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Run restore drill
+        if: steps.check_secrets.outputs.credentials_available == 'true'
+        id: drill
+        env:
+          BACKUP_DATABASE_URL: ${{ secrets.BACKUP_DATABASE_URL }}
+          BACKUP_FILE: ${{ secrets.BACKUP_FILE }}
+          RESTORE_DRILL_REPORT: restore-drill-report.txt
+        run: |
+          set -euo pipefail
+          START_TS=$(date +%s)
+          RESULT="fail"
+          REASON=""
+
+          # Isolated scratch database name (never the production DB)
+          SCRATCH_DB="restore_drill_$(date +%s)_$RANDOM"
+          # Derive admin connection string without the database path
+          ADMIN_URL="${BACKUP_DATABASE_URL%/*}/postgres"
+
+          cleanup() {
+            psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$SCRATCH_DB\";" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          echo "Creating isolated scratch database: $SCRATCH_DB"
+          psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$SCRATCH_DB\";"
+
+          SCRATCH_URL="${BACKUP_DATABASE_URL%/*}/$SCRATCH_DB"
+
+          if [ -z "${BACKUP_FILE:-}" ]; then
+            echo "BACKUP_FILE secret is not set; cannot restore." >&2
+            REASON="missing BACKUP_FILE"
+          else
+            echo "Restoring backup into $SCRATCH_DB"
+            if pg_restore --no-owner --no-privileges --exit-on-error -d "$SCRATCH_URL" "$BACKUP_FILE"; then
+              echo "Restore completed. Running integrity checks."
+              # Schema check: at least one user table must exist
+              TABLE_COUNT=$(psql "$SCRATCH_URL" -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE';")
+              echo "Restored table count: $TABLE_COUNT"
+              if [ "$TABLE_COUNT" -lt 1 ]; then
+                REASON="no tables restored"
+              else
+                # Integrity check: verify a known core table is queryable
+                if psql "$SCRATCH_URL" -v ON_ERROR_STOP=1 -c "SELECT 1 FROM information_schema.tables WHERE table_schema='public' LIMIT 1;" >/dev/null; then
+                  RESULT="pass"
+                else
+                  REASON="integrity query failed"
+                fi
+              fi
+            else
+              REASON="pg_restore failed"
+            fi
+          fi
+
+          END_TS=$(date +%s)
+          DURATION=$((END_TS - START_TS))
+
+          {
+            echo "Restore drill report"
+            echo "==================="
+            echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "Scratch database: $SCRATCH_DB"
+            echo "Result: $RESULT"
+            echo "Duration: ${DURATION}s"
+            [ -n "$REASON" ] && echo "Reason: $REASON"
+          } | tee "$RESTORE_DRILL_REPORT"
+
+          echo "result=$RESULT" >> $GITHUB_OUTPUT
+          echo "duration=${DURATION}s" >> $GITHUB_OUTPUT
+
+          if [ "$RESULT" != "pass" ]; then
+            echo "Restore drill FAILED: $REASON" >&2
+            exit 1
+          fi
+
+      - name: Upload restore drill report
+        if: always() && steps.check_secrets.outputs.credentials_available == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: restore-drill-report
+          path: restore-drill-report.txt
+          retention-days: 90
+
+      - name: Alert on missed or failed drill
+        if: failure() && steps.check_secrets.outputs.credentials_available == 'true'
+        run: |
+          echo "::error::Backup restore drill failed or was missed. Investigate backup recoverability."

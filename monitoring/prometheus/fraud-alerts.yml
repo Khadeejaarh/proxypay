@@ -1,0 +1,97 @@
+groups:
+  - name: fraud-service
+    rules:
+      - alert: FraudServiceHighErrorRate
+        expr: |
+          sum(rate(fraud_service_requests_total{status=~"5.."}[5m]))
+            /
+          sum(rate(fraud_service_requests_total[5m])) > 0.05
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Fraud service error rate above 5%"
+          description: "Fraud service is returning >5% 5xx responses for 10m."
+
+      - alert: FraudServiceHighLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(fraud_service_request_duration_seconds_bucket[5m])) by (le)
+          ) > 1.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Fraud service p95 latency above 1.5s"
+          description: "Fraud scoring latency is degraded; decisions may be timing out."
+
+  - name: fraud-ml-model
+    rules:
+      # Detect stale model deployments: alert when the model version serving
+      # traffic has not changed within the expected retraining window.
+      - alert: FraudMLModelStale
+        expr: |
+          time() - max(fraud_ml_model_info_timestamp_seconds) > 7 * 24 * 3600
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Fraud ML model has not been refreshed in over 7 days"
+          description: "The serving model version ({{ $labels.model_version }}) is older than the expected retraining window."
+
+      # Detect drift in the ML score distribution by comparing the current
+      # mean score against the training baseline.
+      - alert: FraudMLScoreDistributionDrift
+        expr: |
+          abs(
+            sum(rate(fraud_ml_score_sum[1h])) / sum(rate(fraud_ml_score_count[1h]))
+              - on() group_left
+            fraud_ml_score_baseline_mean
+          ) > 0.15
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Fraud ML score distribution drifting from baseline"
+          description: "Mean ML fraud score deviates more than 0.15 from the training baseline."
+
+      # Track missing/failed ML predictions that force heuristic fallback.
+      - alert: FraudMLPredictionFailureRate
+        expr: |
+          sum(rate(fraud_ml_predictions_total{outcome="missing"}[5m]))
+            /
+          sum(rate(fraud_ml_predictions_total[5m])) > 0.10
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Fraud ML prediction failure rate above 10%"
+          description: "More than 10% of ML predictions are missing/failed; heuristic fallback is carrying decisions."
+
+      # Fallback quality: alert when heuristic fallback is used too often,
+      # indicating the ML path is degraded.
+      - alert: FraudMLFallbackRateHigh
+        expr: |
+          sum(rate(fraud_decisions_total{source="heuristic_fallback"}[5m]))
+            /
+          sum(rate(fraud_decisions_total[5m])) > 0.20
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Heuristic fallback used for over 20% of fraud decisions"
+          description: "Fallback to heuristics is elevated; ML verdicts are unavailable or degraded."
+
+      # Delayed labels: alert when label latency grows, delaying model quality
+      # evaluation and retraining signal.
+      - alert: FraudMLLabelLatencyHigh
+        expr: |
+          histogram_quantile(0.90,
+            sum(rate(fraud_ml_label_latency_seconds_bucket[1h])) by (le)
+          ) > 86400
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Fraud ML label latency p90 above 24h"
+          description: "Delayed labels are slowing model quality evaluation and drift detection."
