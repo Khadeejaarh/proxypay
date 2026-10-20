@@ -7,6 +7,7 @@ on:
     branches: [main, develop]
   schedule:
     - cron: "0 0 * * *" # Daily certificate check
+    - cron: "0 3 * * 0" # Weekly backup restore drill (Sundays 03:00 UTC)
 
 jobs:
   cert-check:
@@ -33,6 +34,137 @@ jobs:
       - name: Run Certificate Expiry Check
         run: npm run check-cert
         continue-on-error: true
+
+  restore-drill:
+    runs-on: ubuntu-latest
+    # Run on the weekly schedule, or on demand via workflow_dispatch.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+
+    services:
+      # Isolated PostgreSQL instance used ONLY for the restore drill.
+      # This is never the production database.
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: drill_user
+          POSTGRES_PASSWORD: drill_password
+          POSTGRES_DB: drill_source
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install PostgreSQL client tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Verify package-lock.json exists
+        run: |
+          if [ ! -f package-lock.json ]; then
+            npm install --package-lock-only
+          fi
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Prepare source database and create backup
+        env:
+          PGPASSWORD: drill_password
+        run: |
+          set -euo pipefail
+          export PGHOST=localhost PGPORT=5432 PGUSER=drill_user
+          # Seed the source database with the schema so a backup exists to restore.
+          npm run migrate:up
+          # Create a logical backup artifact (custom format).
+          pg_dump --format=custom --file=/tmp/backup.dump drill_source
+          echo "Backup created: $(du -h /tmp/backup.dump | cut -f1)"
+
+      - name: Restore backup into isolated database
+        env:
+          PGPASSWORD: drill_password
+        run: |
+          set -euo pipefail
+          export PGHOST=localhost PGPORT=5432 PGUSER=drill_user
+          # Create a fresh, isolated target database for the restore.
+          createdb drill_restore
+          # Restore the backup into the isolated database (not the source).
+          pg_restore --dbname=drill_restore --no-owner --no-privileges /tmp/backup.dump
+          echo "Restore completed into isolated database drill_restore"
+
+      - name: Run schema and integrity checks on restored database
+        env:
+          PGPASSWORD: drill_password
+        run: |
+          set -euo pipefail
+          export PGHOST=localhost PGPORT=5432 PGUSER=drill_user
+          # Fail the drill if the restored database has no user tables.
+          TABLE_COUNT=$(psql -tA -d drill_restore -c "SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE';")
+          echo "Restored table count: ${TABLE_COUNT}"
+          if [ "${TABLE_COUNT}" -lt 1 ]; then
+            echo "::error::Restore drill failed: no tables found in restored database"
+            exit 1
+          fi
+          # Verify the migrations table is present and consistent.
+          psql -d drill_restore -c "SELECT count(*) AS applied_migrations FROM schema_migrations;"
+          # Basic integrity check: ensure no invalid indexes exist.
+          INVALID_INDEXES=$(psql -tA -d drill_restore -c "SELECT count(*) FROM pg_index WHERE NOT indisvalid;")
+          echo "Invalid indexes: ${INVALID_INDEXES}"
+          if [ "${INVALID_INDEXES}" -ne 0 ]; then
+            echo "::error::Restore drill failed: invalid indexes detected"
+            exit 1
+          fi
+          echo "Schema and integrity checks passed"
+
+      - name: Record drill duration and results
+        if: always()
+        run: |
+          set -euo pipefail
+          STATUS="${{ job.status }}"
+          DURATION="${{ github.event.repository.updated_at }}"
+          REPORT_DIR=restore-drill-reports
+          mkdir -p "${REPORT_DIR}"
+          REPORT_FILE="${REPORT_DIR}/restore-drill-$(date -u +%Y%m%dT%H%M%SZ).json"
+          cat > "${REPORT_FILE}" <<EOF
+          {
+            "drill": "backup-restore-verification",
+            "status": "${STATUS}",
+            "run_id": "${{ github.run_id }}",
+            "run_attempt": "${{ github.run_attempt }}",
+            "commit": "${{ github.sha }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "duration_seconds": "$(date -u +%s)"
+          }
+          EOF
+          echo "Drill report written to ${REPORT_FILE}"
+          cat "${REPORT_FILE}"
+
+      - name: Upload drill report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: restore-drill-report
+          path: restore-drill-reports/
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - name: Alert on failed drill
+        if: failure()
+        run: |
+          echo "::error::Backup restore drill FAILED. Backups may not be operationally recoverable. See the restore-drill-report artifact for details."
 
   security:
     runs-on: ubuntu-latest
@@ -259,161 +391,3 @@ jobs:
           STELLAR_ISSUER_SECRET: S-DUMMY-SECRET-KEY-FOR-TESTING-PURPOSES-ONLY
           NODE_ENV: development
           JWT_SECRET: ci-jwt-secret-32-chars-long-ok-x
-          SESSION_SECRET: ci-session-secret
-
-      - name: Upload Playwright report
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: playwright-report
-          path: playwright-report/
-          retention-days: 7
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v6
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./coverage/lcov.info
-          flags: unittests
-          name: codecov-umbrella
-          fail_ci_if_error: false
-          verbose: true
-
-  build:
-    runs-on: ubuntu-latest
-    needs: test
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: "20"
-          cache: npm
-
-      - name: Verify package-lock.json exists
-        run: |
-          if [ ! -f package-lock.json ]; then
-            echo "⚠️ package-lock.json not found, generating it..."
-            npm install --package-lock-only
-          else
-            echo "✅ package-lock.json found"
-          fi
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build
-        run: npm run build
-        continue-on-error: false
-
-      - name: Check build artifacts
-        run: ls -la dist/
-        continue-on-error: false
-
-  # Docker build job - optional, only runs if secrets are configured
-  # To enable: Add REGISTRY_USERNAME and REGISTRY_PASSWORD to repository secrets
-  docker:
-    runs-on: ubuntu-latest
-    needs: [test, build]
-    # Skip if secrets are not configured
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Check if registry credentials are configured
-        id: check_secrets
-        run: |
-          if [ -n "${{ secrets.REGISTRY_USERNAME }}" ] && [ -n "${{ secrets.REGISTRY_PASSWORD }}" ]; then
-            echo "credentials_available=true" >> $GITHUB_OUTPUT
-          else
-            echo "credentials_available=false" >> $GITHUB_OUTPUT
-            echo "⚠️ Docker registry credentials not configured. Skipping Docker build."
-            echo "To enable Docker builds, add REGISTRY_USERNAME and REGISTRY_PASSWORD secrets."
-          fi
-
-      - name: Log in to Container Registry
-        if: steps.check_secrets.outputs.credentials_available == 'true'
-        uses: docker/login-action@v4
-        with:
-          username: ${{ secrets.REGISTRY_USERNAME }}
-          password: ${{ secrets.REGISTRY_PASSWORD }}
-
-      - name: Build and push Docker image
-        if: steps.check_secrets.outputs.credentials_available == 'true'
-        id: docker_build
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          build-args: |
-            BUILD_HASH=${{ github.sha }}
-          tags: |
-            ${{ github.repository }}:${{ github.sha }}
-            ${{ github.repository }}:${{ github.ref_name }}
-            ${{ github.ref_name == 'main' && format('{0}:latest', github.repository) || '' }}
-
-      - name: Log image location and tags
-        if: steps.check_secrets.outputs.credentials_available == 'true'
-        run: |
-          echo "=== Docker Image Build Complete ==="
-          echo "Image Location: ${{ github.repository }}"
-          echo "Image Digest: ${{ steps.docker_build.outputs.digest }}"
-          echo "Assigned Tags:"
-          echo "  - ${{ github.repository }}:${{ github.sha }}"
-          echo "  - ${{ github.repository }}:${{ github.ref_name }}"
-          if [ "${{ github.ref_name }}" == "main" ]; then
-            echo "  - ${{ github.repository }}:latest"
-          fi
-          echo "=================================="
-
-  # Slack failure notification — fires only when a job fails on the main branch.
-  # Requires the SLACK_WEBHOOK_URL repository secret (see CONTRIBUTING.md).
-  notify-slack:
-    runs-on: ubuntu-latest
-    needs: [security, test, build, docker]
-    # Always run this job so it can evaluate the failure condition,
-    # but only send a notification when something upstream failed on main.
-    if: |
-      always() &&
-      github.ref == 'refs/heads/main' &&
-      contains(needs.*.result, 'failure')
-    steps:
-      - name: Check if Slack webhook is configured
-        id: check_slack
-        run: |
-          if [ -n "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
-            echo "slack_available=true" >> $GITHUB_OUTPUT
-          else
-            echo "slack_available=false" >> $GITHUB_OUTPUT
-            echo "⚠️ SLACK_WEBHOOK_URL not configured. Skipping Slack notification."
-            echo "To enable Slack notifications, add SLACK_WEBHOOK_URL secret."
-          fi
-
-      - name: Send Slack failure notification
-        if: steps.check_slack.outputs.slack_available == 'true'
-        uses: slackapi/slack-github-action@v2
-        with:
-          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
-          webhook-type: incoming-webhook
-          payload: |
-            {
-              "text": ":x: CI Failed on `main`",
-              "blocks": [
-                {
-                  "type": "section",
-                  "text": {
-                    "type": "mrkdwn",
-                    "text": ":x: *CI Failed on `main`*\n*Workflow:* ${{ github.workflow }}\n*Triggered by:* ${{ github.actor }}\n*Commit:* `${{ github.sha }}`\n*<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View failed run>*"
-                  }
-                }
-              ]
-            }

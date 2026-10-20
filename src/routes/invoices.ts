@@ -4,6 +4,9 @@ import { requireRole } from '../middleware/rbac';
 import { TimeoutPresets, haltOnTimedout } from '../middleware/timeout';
 import { InvoiceModel, InvoiceStatus, type Invoice } from '../models/invoice';
 import logger from '../utils/logger';
+import { s3Service } from '../services/s3';
+import { emailService } from '../services/email';
+import { invoiceDeliveryQueue } from '../queues/invoiceDelivery';
 
 const invoiceRoutes = Router();
 const invoiceModel = new InvoiceModel();
@@ -94,11 +97,27 @@ invoiceRoutes.get(
         return res.status(400).json({ error: 'Invoice PDF not available' });
       }
 
-      // TODO: Fetch PDF from storage (S3, etc.)
-      // For now, return placeholder
+      let pdf: Buffer;
+      try {
+        pdf = await s3Service.getObject(invoice.pdfStorageKey);
+      } catch (storageErr) {
+        logger.error(
+          { error: storageErr, invoiceId: id, storageKey: invoice.pdfStorageKey },
+          'Failed to retrieve invoice PDF from storage'
+        );
+        return res.status(502).json({ error: 'Invoice PDF could not be retrieved from storage' });
+      }
+
+      if (!pdf || pdf.length === 0) {
+        return res.status(404).json({ error: 'Invoice PDF not found in storage' });
+      }
+
+      const safeFilename = `${String(invoice.invoiceNumber).replace(/[^A-Za-z0-9._-]/g, '_')}.pdf`;
+
       res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Disposition', `attachment; filename="${invoice.invoiceNumber}.pdf"`);
-      res.status(200).send(Buffer.from('PDF content placeholder'));
+      res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
+      res.setHeader('Content-Length', String(pdf.length));
+      res.status(200).send(pdf);
     } catch (err) {
       logger.error({ error: err }, 'Failed to download invoice');
       res.status(500).json({ error: 'Failed to download invoice' });
@@ -129,11 +148,45 @@ invoiceRoutes.post(
         return res.status(403).json({ error: 'Access denied' });
       }
 
-      // TODO: Resend invoice via email
-      res.json({
+      // Only resendable invoices may be delivered
+      const resendableStatuses: InvoiceStatus[] = [InvoiceStatus.Generated, InvoiceStatus.Sent];
+      if (!resendableStatuses.includes(invoice.status)) {
+        return res.status(409).json({
+          error: 'Invoice is not in a resendable state',
+          status: invoice.status,
+        });
+      }
+
+      // Validate recipient email
+      const recipient = invoice.customerEmail;
+      if (!recipient || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipient)) {
+        return res.status(422).json({ error: 'Invoice has no valid recipient email' });
+      }
+
+      if (!invoice.pdfStorageKey) {
+        return res.status(400).json({ error: 'Invoice PDF not available' });
+      }
+
+      // Enqueue an idempotent delivery job (dedupe by invoice id)
+      const job = await invoiceDeliveryQueue.add(
+        'resend',
+        { invoiceId: id, recipient },
+        {
+          jobId: `invoice-resend:${id}`,
+          attempts: 3,
+          backoff: { type: 'exponential', delay: 5000 },
+          removeOnComplete: true,
+          removeOnFail: false,
+        }
+      );
+
+      logger.info({ invoiceId: id, jobId: job.id }, 'Invoice resend delivery enqueued');
+
+      res.status(202).json({
         message: 'Invoice resend queued',
         invoiceId: id,
-        status: 'pending',
+        jobId: job.id,
+        status: 'queued',
       });
     } catch (err) {
       logger.error({ error: err }, 'Failed to resend invoice');
